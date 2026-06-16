@@ -1,0 +1,8 @@
+diff --git a/fixtures/basic_src.php b/fixtures/basic_src.php
+index 1111111..2222222 100644
+--- a/fixtures/basic_src.php
++++ b/fixtures/basic_src.php
+@@ -1,2 +1,2 @@
+ <?php
+-function basic_value() { return "ORIG"; }
++function basic_value() { return "PATCHED"; }

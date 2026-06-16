@@ -1,0 +1,5 @@
+# phpatcher-ed v1
+# file: fixtures/ed_src.php
+2c
+function ed_value() { return "PATCHED"; }
+.
