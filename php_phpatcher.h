@@ -11,7 +11,7 @@ extern "C" {
 
 #include "php.h"
 
-#define PHP_PHPATCHER_VERSION "0.1.0"
+#define PHP_PHPATCHER_VERSION "1.0.0"
 
 extern zend_module_entry phpatcher_module_entry;
 #define phpext_phpatcher_ptr &phpatcher_module_entry

@@ -35,6 +35,7 @@ ZEND_BEGIN_MODULE_GLOBALS(phpatcher)
     char *base_dir;
     bool enabled;
     bool strict;
+    bool precompute;
     bool cache;
 ZEND_END_MODULE_GLOBALS(phpatcher)
 
@@ -57,12 +58,16 @@ static phpatcher::PatchSet *g_patchset = nullptr;
 /* Patched contents precomputed once in MINIT, keyed by canonical path. Built
  * before any request runs and never mutated afterwards, so the compile hook can
  * read it lock-free (no mutex, no file I/O, no patch application on the hot
- * path). Files that could not be read/applied at startup are simply absent and
- * fall back to the lazy cache below. */
+ * path). Under a forking SAPI (php-fpm, prefork) MINIT runs in the master, so
+ * this map is shared with every worker via copy-on-write: its cost is paid once
+ * for the whole pool, not per worker. Files that could not be read/applied at
+ * startup are simply absent and fall back to the lazy cache below. */
 static std::unordered_map<std::string, std::string> *g_precomputed = nullptr;
 
-/* Lazy cache of patched contents for files not precomputed (e.g. created after
- * startup). Guarded by a mutex for ZTS builds; on NTS there is no contention. */
+/* Lazy, per-process cache of patched contents for files not precomputed (e.g.
+ * created after startup, or when precompute is disabled). Unlike g_precomputed
+ * this is populated inside workers, so it is NOT shared across a php-fpm pool.
+ * Guarded by a mutex for ZTS builds; on NTS there is no contention. */
 static std::unordered_map<std::string, std::string> *g_cache = nullptr;
 static std::mutex g_cache_mutex;
 
@@ -82,6 +87,8 @@ PHP_INI_BEGIN()
                         enabled, zend_phpatcher_globals, phpatcher_globals)
     STD_PHP_INI_BOOLEAN("phpatcher.strict", "1", PHP_INI_SYSTEM, OnUpdateBool,
                         strict, zend_phpatcher_globals, phpatcher_globals)
+    STD_PHP_INI_BOOLEAN("phpatcher.precompute", "1", PHP_INI_SYSTEM, OnUpdateBool,
+                        precompute, zend_phpatcher_globals, phpatcher_globals)
     STD_PHP_INI_BOOLEAN("phpatcher.cache", "1", PHP_INI_SYSTEM, OnUpdateBool,
                         cache, zend_phpatcher_globals, phpatcher_globals)
 PHP_INI_END()
@@ -91,6 +98,7 @@ static void php_phpatcher_globals_ctor(zend_phpatcher_globals *g) {
     g->base_dir = nullptr;
     g->enabled = true;
     g->strict = true;
+    g->precompute = true;
     g->cache = true;
 }
 
@@ -259,6 +267,15 @@ static zend_op_array *phpatcher_compile_file(zend_file_handle *file_handle, int 
 /* Userland introspection helpers.                                            */
 /* ------------------------------------------------------------------------- */
 
+/* Total byte size of all patched contents held in a content map. */
+static size_t phpatcher_map_bytes(const std::unordered_map<std::string, std::string> &m) {
+    size_t total = 0;
+    for (const auto &kv : m) {
+        total += kv.second.size();
+    }
+    return total;
+}
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_phpatcher_get_files, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
@@ -281,9 +298,44 @@ PHP_FUNCTION(phpatcher_enabled) {
     RETURN_BOOL(g_patchset != nullptr);
 }
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_phpatcher_stats, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+/* Runtime stats for monitoring. `precomputed_bytes` is the copy-on-write memory
+ * shared across a php-fpm pool (paid once); `cached_bytes` is per-process. */
+PHP_FUNCTION(phpatcher_stats) {
+    ZEND_PARSE_PARAMETERS_NONE();
+    array_init(return_value);
+
+    add_assoc_bool(return_value, "active", g_patchset != nullptr);
+    add_assoc_bool(return_value, "strict", PHPATCHER_G(strict));
+    add_assoc_bool(return_value, "precompute", PHPATCHER_G(precompute));
+    add_assoc_bool(return_value, "cache", PHPATCHER_G(cache));
+    add_assoc_long(return_value, "indexed_files",
+                   g_patchset ? static_cast<zend_long>(g_patchset->file_count()) : 0);
+
+    zend_long precomputed_files = 0, precomputed_bytes = 0;
+    if (g_precomputed) {
+        precomputed_files = static_cast<zend_long>(g_precomputed->size());
+        precomputed_bytes = static_cast<zend_long>(phpatcher_map_bytes(*g_precomputed));
+    }
+    add_assoc_long(return_value, "precomputed_files", precomputed_files);
+    add_assoc_long(return_value, "precomputed_bytes", precomputed_bytes);
+
+    zend_long cached_files = 0, cached_bytes = 0;
+    if (g_cache) {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        cached_files = static_cast<zend_long>(g_cache->size());
+        cached_bytes = static_cast<zend_long>(phpatcher_map_bytes(*g_cache));
+    }
+    add_assoc_long(return_value, "cached_files", cached_files);
+    add_assoc_long(return_value, "cached_bytes", cached_bytes);
+}
+
 static const zend_function_entry phpatcher_functions[] = {
     PHP_FE(phpatcher_get_files, arginfo_phpatcher_get_files)
     PHP_FE(phpatcher_enabled, arginfo_phpatcher_enabled)
+    PHP_FE(phpatcher_stats, arginfo_phpatcher_stats)
     PHP_FE_END
 };
 
@@ -365,8 +417,9 @@ PHP_MINIT_FUNCTION(phpatcher) {
     g_cache = new (std::nothrow) std::unordered_map<std::string, std::string>();
 
     /* Precompute patched content so the compile hook is a lock-free lookup +
-     * memcpy on the hot path (see g_precomputed). */
-    if (PHPATCHER_G(cache)) {
+     * memcpy on the hot path, and (under a forking SAPI) so the cost is paid
+     * once in the master and shared with workers via copy-on-write. */
+    if (PHPATCHER_G(precompute)) {
         phpatcher_precompute(*g_patchset);
     }
 
@@ -378,7 +431,11 @@ PHP_MINIT_FUNCTION(phpatcher) {
 }
 
 PHP_MSHUTDOWN_FUNCTION(phpatcher) {
-    if (phpatcher_orig_compile_file != nullptr) {
+    /* Unchain only if we are still the head: if another extension wrapped us
+     * after MINIT, blindly restoring the pointer would drop its handler. (In
+     * the usual reverse-shutdown order it has already unwrapped us by now.) */
+    if (phpatcher_orig_compile_file != nullptr &&
+        zend_compile_file == phpatcher_compile_file) {
         zend_compile_file = phpatcher_orig_compile_file;
         phpatcher_orig_compile_file = nullptr;
     }
@@ -401,9 +458,15 @@ PHP_MINFO_FUNCTION(phpatcher) {
     php_info_print_table_row(2, "Active",
                              g_patchset != nullptr ? "yes" : "no");
     if (g_patchset != nullptr) {
-        char count[32];
-        snprintf(count, sizeof(count), "%zu", g_patchset->file_count());
-        php_info_print_table_row(2, "Indexed files", count);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%zu", g_patchset->file_count());
+        php_info_print_table_row(2, "Indexed files", buf);
+        if (g_precomputed != nullptr) {
+            snprintf(buf, sizeof(buf), "%zu", g_precomputed->size());
+            php_info_print_table_row(2, "Precomputed files", buf);
+            snprintf(buf, sizeof(buf), "%zu", phpatcher_map_bytes(*g_precomputed));
+            php_info_print_table_row(2, "Precomputed bytes (shared)", buf);
+        }
     }
     php_info_print_table_end();
     DISPLAY_INI_ENTRIES();

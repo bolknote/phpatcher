@@ -57,3 +57,6 @@ tests/unit/*.dSYM/
 
 # Examples
 example/
+
+# Editor / agent local config
+.cursor/
