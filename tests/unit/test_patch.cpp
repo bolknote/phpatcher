@@ -336,7 +336,7 @@ static void test_ed_multi_file() {
     const FilePatch *f1 = ps.find(PatchSet::canonicalize("em1.php", g_tmpdir));
     const FilePatch *f2 = ps.find(PatchSet::canonicalize("em2.php", g_tmpdir));
     CHECK(f1 && f2);
-    CHECK(f1->is_ed && f2->is_ed);
+    CHECK(f1->is_ed() && f2->is_ed());
     CHECK(PatchSet::apply(*f1, "1\n", out, err));
     CHECK_EQ(out, std::string("one\n"));
     CHECK(PatchSet::apply(*f2, "2\n", out, err));
@@ -697,19 +697,17 @@ static void test_short_hunk_then_next_file() {
     CHECK_EQ(ps.file_count(), static_cast<std::size_t>(2));
 }
 
-/* apply() must tolerate a hand-built FilePatch that contains an empty body
- * line without throwing. */
-static void test_apply_empty_body_line() {
-    FilePatch fp;
-    fp.target_path = "x";
+/* apply() must work on a hand-built FilePatch assembled through the typed API
+ * (default-constructed FilePatch is a unified-diff patch). */
+static void test_apply_hand_built_hunk() {
+    FilePatch fp;  /* defaults to the unified-diff (hunks) representation */
     phpatcher::Hunk h;
     h.orig_start = 1;
     h.orig_count = 1;
     h.new_start = 1;
     h.new_count = 1;
-    h.lines.push_back(std::string());  /* empty body line: must be ignored */
-    h.lines.push_back(std::string(" a"));
-    fp.hunks.push_back(h);
+    h.lines.push_back({phpatcher::LineKind::Context, "a"});
+    fp.hunks().push_back(std::move(h));
     std::string out, err;
     CHECK(PatchSet::apply(fp, "a\n", out, err));
     CHECK_EQ(out, std::string("a\n"));
@@ -752,6 +750,16 @@ static void test_basename_of() {
     CHECK_EQ(PatchSet::basename_of("c.php"), std::string("c.php"));
     CHECK_EQ(PatchSet::basename_of("/a/b/"), std::string(""));
     CHECK_EQ(PatchSet::basename_of(""), std::string(""));
+}
+
+static void test_duplicate_section_fails() {
+    /* Two sections targeting the same file must be rejected at parse time. */
+    PatchSet ps;
+    std::string err;
+    const std::string diff =
+        "--- a/dup.php\n+++ b/dup.php\n@@ -1 +1 @@\n-1\n+one\n"
+        "--- a/dup.php\n+++ b/dup.php\n@@ -1 +1 @@\n-1\n+uno\n";
+    CHECK(!ps.parse(diff, g_tmpdir, err));
 }
 
 static void test_basename_index() {
@@ -825,12 +833,13 @@ int main() {
     test_ed_insert_out_of_range_fail();
     test_delete_side_uses_old_path();
     test_short_hunk_then_next_file();
-    test_apply_empty_body_line();
+    test_apply_hand_built_hunk();
 
     test_clean_path_trailing_space();
     test_read_empty_file();
     test_short_hunk_underrun();
     test_basename_of();
+    test_duplicate_section_fails();
     test_basename_index();
 
     /* Best-effort cleanup. */

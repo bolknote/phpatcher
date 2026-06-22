@@ -9,11 +9,13 @@
  *   - Parsing and application work over std::string_view slices of the caller's
  *     buffers; only the data that must outlive the call (hunk/ed bodies, index
  *     keys, the final output) is materialised into owning std::strings.
- *   - Lookups are O(1) average via a hash map keyed by canonical path.
+ *   - The index is a flat array sorted by canonical path; lookups are O(log n)
+ *     via binary search, and the contiguous storage is cache- and COW-friendly.
  */
 #include "patch.hpp"
 
-#include <climits>
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -87,14 +89,14 @@ string_view rtrim(string_view s) {
 }
 
 /* Read a non-negative decimal integer at `s[pos]`, advancing `pos` past it.
- * Returns false when no digit is present or the value would overflow `long`. */
-bool read_uint(string_view s, std::size_t& pos, long& out) {
+ * Returns false when no digit is present or the value would overflow int64. */
+bool read_uint(string_view s, std::size_t& pos, std::int64_t& out) {
     if (pos >= s.size() || !is_digit(s[pos])) {
         return false;
     }
-    long value = 0;
+    std::int64_t value = 0;
     while (pos < s.size() && is_digit(s[pos])) {
-        if (value > (LONG_MAX - 9) / 10) {
+        if (value > (INT64_MAX - 9) / 10) {
             return false;  /* reject rather than wrap (signed overflow is UB) */
         }
         value = value * 10 + (s[pos] - '0');
@@ -135,7 +137,7 @@ bool parse_hunk_header(string_view line, Hunk& hunk) {
     }
 
     /* A range is "<sign>start[,count]"; `marker` points at the sign. */
-    auto read_range = [&](std::size_t marker, long& start, long& count) -> bool {
+    auto read_range = [&](std::size_t marker, std::int64_t& start, std::int64_t& count) -> bool {
         std::size_t pos = marker + 1;
         if (!read_uint(line, pos, start)) {
             return false;
@@ -174,11 +176,11 @@ bool looks_like_ed_bundle(string_view text) {
  * and reports via `needs_input` whether an a/c/i text block follows. */
 bool parse_ed_command(string_view line, EdCommand& cmd, bool& needs_input) {
     std::size_t pos = 0;
-    long first = 0;
+    std::int64_t first = 0;
     if (!read_uint(line, pos, first)) {
         return false;
     }
-    long second = first;
+    std::int64_t second = first;
     if (pos < line.size() && line[pos] == ',') {
         ++pos;
         if (!read_uint(line, pos, second)) {
@@ -229,8 +231,8 @@ bool apply_ed_script(const FilePatch& fp, string_view original,
         return false;
     };
 
-    for (const EdCommand& c : fp.ed) {
-        const auto size = static_cast<long>(lines.size());
+    for (const EdCommand& c : fp.ed()) {
+        const auto size = static_cast<std::int64_t>(lines.size());
         switch (c.kind) {
             case EdCommand::Delete:
                 if (c.start < 1 || c.end < c.start || c.end > size) {
@@ -270,9 +272,9 @@ bool apply_ed_script(const FilePatch& fp, string_view original,
 
 }  // namespace
 
-std::string PatchSet::basename_of(const std::string& path) {
+std::string PatchSet::basename_of(string_view path) {
     const std::size_t slash = path.find_last_of('/');
-    return slash == std::string::npos ? path : path.substr(slash + 1);
+    return std::string(slash == npos ? path : path.substr(slash + 1));
 }
 
 std::string PatchSet::canonicalize(const std::string& path, const std::string& base_dir) {
@@ -333,30 +335,43 @@ bool read_file(const std::string& path, std::string& out) {
     return true;
 }
 
-bool PatchSet::add_file(FilePatch&& fp, std::string& error) {
-    if (index_.find(fp.target_path) != index_.end()) {
-        error = "duplicate patch section for " + fp.target_path;
-        return false;
+bool PatchSet::finalize(std::string& error) {
+    std::sort(index_.begin(), index_.end(),
+              [](const Entry& a, const Entry& b) { return a.first < b.first; });
+
+    for (std::size_t i = 1; i < index_.size(); ++i) {
+        if (index_[i].first == index_[i - 1].first) {
+            error = "duplicate patch section for " + index_[i].first;
+            return false;
+        }
     }
-    basenames_.insert(basename_of(fp.target_path));
-    std::string key = fp.target_path;
-    index_[std::move(key)] = std::move(fp);
+
+    basenames_.clear();
+    basenames_.reserve(index_.size());
+    for (const Entry& e : index_) {
+        basenames_.push_back(basename_of(e.first));
+    }
+    std::sort(basenames_.begin(), basenames_.end());
+    basenames_.erase(std::unique(basenames_.begin(), basenames_.end()), basenames_.end());
     return true;
 }
 
 void PatchSet::recanonicalize(const std::function<std::string(const std::string&)>& fn) {
-    std::unordered_map<std::string, FilePatch> rebuilt;
-    std::unordered_set<std::string> bn;
-    rebuilt.reserve(index_.size());
-    for (auto& kv : index_) {
-        FilePatch fp = std::move(kv.second);
-        std::string canon = fn(fp.target_path);
-        fp.target_path = canon;
-        bn.insert(basename_of(canon));
-        rebuilt[std::move(canon)] = std::move(fp);
+    for (Entry& e : index_) {
+        e.first = fn(e.first);
     }
-    index_ = std::move(rebuilt);
-    basenames_ = std::move(bn);
+    /* Re-canonicalization can only narrow distinct keys onto the same path in
+     * pathological setups; tolerate it (first match wins) rather than error in a
+     * void method, but keep the index sorted and the basename filter rebuilt. */
+    std::sort(index_.begin(), index_.end(),
+              [](const Entry& a, const Entry& b) { return a.first < b.first; });
+    basenames_.clear();
+    basenames_.reserve(index_.size());
+    for (const Entry& e : index_) {
+        basenames_.push_back(basename_of(e.first));
+    }
+    std::sort(basenames_.begin(), basenames_.end());
+    basenames_.erase(std::unique(basenames_.begin(), basenames_.end()), basenames_.end());
 }
 
 bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, std::string& error) {
@@ -371,23 +386,22 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
     const std::vector<string_view> lines = split_lines(diff_text, ends_nl);
 
     FilePatch current;
+    std::string current_key;   /* canonical path of `current`, the index key  */
     bool have_current = false;
-    std::string pending_old;  /* path from the last "--- " line */
-    std::string pending_new;  /* path from the last "+++ " line */
+    std::string pending_old;   /* path from the last "--- " line */
+    std::string pending_new;   /* path from the last "+++ " line */
     Hunk* active_hunk = nullptr;
-    long need_orig = 0;  /* original-side body lines still expected by active_hunk */
-    long need_new = 0;   /* new-side body lines still expected by active_hunk      */
+    std::int64_t need_orig = 0; /* original-side body lines still expected by active_hunk */
+    std::int64_t need_new = 0;  /* new-side body lines still expected by active_hunk      */
 
-    const auto flush_current = [&]() -> bool {
-        if (have_current && !current.hunks.empty()) {
-            if (!add_file(std::move(current), error)) {
-                return false;
-            }
+    const auto flush_current = [&]() {
+        if (have_current && !current.hunks().empty()) {
+            index_.emplace_back(std::move(current_key), std::move(current));
         }
         current = FilePatch();
+        current_key.clear();
         have_current = false;
         active_hunk = nullptr;
-        return true;
     };
 
     const auto begin_file = [&]() -> bool {
@@ -401,12 +415,8 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
             error = "diff hunk without a usable target file path";
             return false;
         }
-        if (!flush_current()) {
-            return false;
-        }
-        current.diff_old_path = pending_old;
-        current.diff_new_path = pending_new;
-        current.target_path = canonicalize(std::string(chosen), base_dir);
+        flush_current();
+        current_key = canonicalize(std::string(chosen), base_dir);
         have_current = true;
         return true;
     };
@@ -420,22 +430,25 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
          * line counts in the hunk header tell us exactly where the body ends. */
         if (active_hunk != nullptr && (need_orig > 0 || need_new > 0)) {
             const char marker = line.empty() ? ' ' : line[0];
+            /* Body content is the line without its marker byte (empty for an
+             * empty context line, which a diff may emit as a wholly blank line). */
+            const string_view content = line.size() <= 1 ? string_view() : line.substr(1);
             switch (marker) {
                 case ' ':  /* context line (an empty line is empty context) */
-                    active_hunk->lines.push_back(line.empty() ? " " : std::string(line));
+                    active_hunk->lines.push_back({LineKind::Context, std::string(content)});
                     --need_orig;
                     --need_new;
                     break;
                 case '-':  /* removed from the original */
-                    active_hunk->lines.push_back(std::string(line));
+                    active_hunk->lines.push_back({LineKind::Remove, std::string(content)});
                     --need_orig;
                     break;
                 case '+':  /* added in the patched file */
-                    active_hunk->lines.push_back(std::string(line));
+                    active_hunk->lines.push_back({LineKind::Add, std::string(content)});
                     --need_new;
                     break;
                 case '\\':  /* "\ No newline" note; consumes no original/new line */
-                    active_hunk->lines.push_back(std::string(line));
+                    active_hunk->lines.push_back({LineKind::NoNewline, std::string()});
                     break;
                 default:
                     /* Fewer body lines than declared: end the hunk and revisit
@@ -450,7 +463,7 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
         /* A trailing "\ No newline at end of file" note belongs to the hunk we
          * have just finished consuming. */
         if (active_hunk != nullptr && !line.empty() && line[0] == '\\') {
-            active_hunk->lines.push_back(std::string(line));
+            active_hunk->lines.push_back({LineKind::NoNewline, std::string()});
             continue;
         }
         active_hunk = nullptr;  /* the active hunk (if any) is now complete */
@@ -473,8 +486,8 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
                 error = "malformed hunk header: " + std::string(line);
                 return false;
             }
-            current.hunks.push_back(std::move(hunk));
-            active_hunk = &current.hunks.back();
+            current.hunks().push_back(std::move(hunk));
+            active_hunk = &current.hunks().back();
             need_orig = active_hunk->orig_count;
             need_new = active_hunk->new_count;
         }
@@ -482,10 +495,8 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
          * mode, rename/copy, binary markers, ...) and is ignored. */
     }
 
-    if (!flush_current()) {
-        return false;
-    }
-    return true;  /* an empty diff (no hunks) is a valid no-op */
+    flush_current();
+    return finalize(error);  /* also rejects a file targeted by two sections */
 }
 
 bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& base_dir,
@@ -494,29 +505,28 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
     const std::vector<string_view> lines = split_lines(diff_text, ends_nl);
 
     FilePatch current;
-    current.is_ed = true;
+    current.make_ed();
+    std::string current_key;  /* canonical path of `current`, the index key */
     bool have_current = false;
 
     EdCommand pending;
     bool in_input = false;
 
-    const auto flush_current = [&]() -> bool {
-        if (have_current && !current.ed.empty()) {
-            if (!add_file(std::move(current), error)) {
-                return false;
-            }
+    const auto flush_current = [&]() {
+        if (have_current && !current.ed().empty()) {
+            index_.emplace_back(std::move(current_key), std::move(current));
         }
         current = FilePatch();
-        current.is_ed = true;
+        current.make_ed();
+        current_key.clear();
         have_current = false;
-        return true;
     };
 
     for (const string_view line : lines) {
         /* Inside an a/c/i text block: collect lines until a lone "." */
         if (in_input) {
             if (line.size() == 1 && line[0] == kEdInputTerminator) {
-                current.ed.push_back(std::move(pending));
+                current.ed().push_back(std::move(pending));
                 pending = EdCommand();
                 in_input = false;
             } else {
@@ -532,12 +542,8 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
                 error = "empty '# file:' header in ed bundle";
                 return false;
             }
-            if (!flush_current()) {
-                return false;
-            }
-            const std::string clean(path.substr(s));
-            current.target_path = canonicalize(clean, base_dir);
-            current.diff_new_path = clean;
+            flush_current();
+            current_key = canonicalize(std::string(path.substr(s)), base_dir);
             have_current = true;
             continue;
         }
@@ -568,7 +574,7 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
             pending = std::move(cmd);
             in_input = true;
         } else {
-            current.ed.push_back(std::move(cmd));
+            current.ed().push_back(std::move(cmd));
         }
     }
 
@@ -577,20 +583,29 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
         return false;
     }
 
-    if (!flush_current()) {
-        return false;
-    }
-    return true;  /* a bundle with no file sections is a valid no-op */
+    flush_current();
+    return finalize(error);  /* also rejects a file targeted by two sections */
 }
 
-const FilePatch* PatchSet::find(const std::string& canonical_path) const {
-    const auto it = index_.find(canonical_path);
-    return it == index_.end() ? nullptr : &it->second;
+const FilePatch* PatchSet::find(std::string_view canonical_path) const {
+    const auto it = std::lower_bound(
+        index_.begin(), index_.end(), canonical_path,
+        [](const Entry& e, std::string_view key) { return string_view(e.first) < key; });
+    if (it != index_.end() && string_view(it->first) == canonical_path) {
+        return &it->second;
+    }
+    return nullptr;
+}
+
+bool PatchSet::has_basename(std::string_view basename) const {
+    return std::binary_search(
+        basenames_.begin(), basenames_.end(), basename,
+        [](string_view a, string_view b) { return a < b; });
 }
 
 bool PatchSet::apply(const FilePatch& fp, const std::string& original,
                      std::string& out, std::string& error) {
-    if (fp.is_ed) {
+    if (fp.is_ed()) {
         return apply_ed_script(fp, original, out, error);
     }
 
@@ -604,10 +619,10 @@ bool PatchSet::apply(const FilePatch& fp, const std::string& original,
     bool consumed_to_eof = false;  /* did the last hunk reach the end of `src`? */
     bool new_eof_no_nl = false;    /* should the rebuilt EOF omit its newline?  */
 
-    for (const Hunk& hunk : fp.hunks) {
+    for (const Hunk& hunk : fp.hunks()) {
         /* Where this hunk starts in the original (0-based). A pure insertion
          * (orig_count == 0) starts after `orig_start` lines. */
-        const long raw_start = (hunk.orig_count == 0) ? hunk.orig_start : hunk.orig_start - 1;
+        const std::int64_t raw_start = (hunk.orig_count == 0) ? hunk.orig_start : hunk.orig_start - 1;
         const auto start_index = static_cast<std::size_t>(raw_start < 0 ? 0 : raw_start);
 
         if (start_index < cursor) {
@@ -623,37 +638,37 @@ bool PatchSet::apply(const FilePatch& fp, const std::string& original,
             result.push_back(src[cursor]);
         }
 
-        char prev_marker = 0;
-        for (const std::string& body : hunk.lines) {
-            if (body.empty()) {
-                continue;  /* defensive: parse() never emits empty body lines */
+        LineKind prev_kind = LineKind::Context;
+        for (const DiffLine& dl : hunk.lines) {
+            const string_view text(dl.text);
+            switch (dl.kind) {
+                case LineKind::Context:
+                    if (cursor >= src.size() || src[cursor] != text) {
+                        error = "context mismatch at original line " + std::to_string(cursor + 1);
+                        return false;
+                    }
+                    result.push_back(src[cursor++]);
+                    new_eof_no_nl = false;
+                    break;
+                case LineKind::Remove:
+                    if (cursor >= src.size() || src[cursor] != text) {
+                        error = "removal mismatch at original line " + std::to_string(cursor + 1);
+                        return false;
+                    }
+                    ++cursor;
+                    break;
+                case LineKind::Add:
+                    result.push_back(text);
+                    new_eof_no_nl = false;
+                    break;
+                case LineKind::NoNewline:
+                    /* The note refers to the side of the immediately preceding line. */
+                    if (prev_kind == LineKind::Add || prev_kind == LineKind::Context) {
+                        new_eof_no_nl = true;
+                    }
+                    break;
             }
-            const char marker = body[0];
-            const string_view text(body.data() + 1, body.size() - 1);
-
-            if (marker == ' ') {
-                if (cursor >= src.size() || src[cursor] != text) {
-                    error = "context mismatch at original line " + std::to_string(cursor + 1);
-                    return false;
-                }
-                result.push_back(src[cursor++]);
-                new_eof_no_nl = false;
-            } else if (marker == '-') {
-                if (cursor >= src.size() || src[cursor] != text) {
-                    error = "removal mismatch at original line " + std::to_string(cursor + 1);
-                    return false;
-                }
-                ++cursor;
-            } else if (marker == '+') {
-                result.push_back(text);
-                new_eof_no_nl = false;
-            } else if (marker == '\\') {
-                /* The note refers to the side of the immediately preceding line. */
-                if (prev_marker == '+' || prev_marker == ' ') {
-                    new_eof_no_nl = true;
-                }
-            }
-            prev_marker = marker;
+            prev_kind = dl.kind;
         }
 
         consumed_to_eof = (cursor >= src.size());

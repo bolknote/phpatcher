@@ -194,7 +194,7 @@ static bool phpatcher_canonical_path(zend_file_handle *fh, std::string &out) {
  * first, so unpatched files (the common case) never reach realpath(). */
 static const phpatcher::FilePatch *phpatcher_resolve(zend_file_handle *fh, std::string &path) {
     const std::string_view base = phpatcher_basename(fh);
-    if (base.empty() || !g_patchset->has_basename(std::string(base))) {
+    if (base.empty() || !g_patchset->has_basename(base)) {
         return nullptr;
     }
 
