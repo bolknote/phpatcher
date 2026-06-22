@@ -9,6 +9,8 @@
 
 #include "patch.hpp"
 
+#include <atomic>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -21,6 +23,7 @@ extern "C" {
 #include "Zend/zend_API.h"
 #include "Zend/zend_compile.h"
 #include "Zend/zend_stream.h"
+#include "Zend/zend_system_id.h"
 #include "Zend/zend_virtual_cwd.h"
 }
 
@@ -33,10 +36,12 @@ extern "C" {
 ZEND_BEGIN_MODULE_GLOBALS(phpatcher)
     char *patch_file;
     char *base_dir;
+    char *on_error;   /* "original" (fail-open) or "fail" (fail-closed) */
     bool enabled;
     bool strict;
     bool precompute;
     bool cache;
+    bool opcache_bind;  /* fold the patch identity into OPcache's system_id */
 ZEND_END_MODULE_GLOBALS(phpatcher)
 
 ZEND_DECLARE_MODULE_GLOBALS(phpatcher)
@@ -74,6 +79,34 @@ static std::mutex g_cache_mutex;
 /* Previous compile_file handler in the chain (e.g. OPcache). */
 static zend_op_array *(*phpatcher_orig_compile_file)(zend_file_handle *, int) = nullptr;
 
+/* Runtime failure counters, exposed via phpatcher_stats() so a drifted patch is
+ * observable even when E_WARNING is silenced in production. Atomic for ZTS. */
+static std::atomic<uint64_t> g_apply_failures{0};
+static std::atomic<uint64_t> g_read_failures{0};
+static std::atomic<uint64_t> g_skipped_halt{0};
+static std::string g_last_error;
+static std::mutex g_last_error_mutex;
+
+static void phpatcher_record_error(const std::string &msg) {
+    std::lock_guard<std::mutex> lock(g_last_error_mutex);
+    g_last_error = msg;
+}
+
+/* True when a patch that does not apply must NOT fall back to the original code
+ * (phpatcher.on_error = "fail"): the file is replaced with a throwing stub so
+ * the unpatched (e.g. still-vulnerable) code never runs. */
+static bool phpatcher_fail_closed() {
+    const char *mode = PHPATCHER_G(on_error);
+    return mode != nullptr && std::strcmp(mode, "fail") == 0;
+}
+
+/* Outcome of producing patched content for a file. */
+enum class PatchStatus {
+    Ok,    /* patched content is ready                                  */
+    Skip,  /* deliberately not patched; compile the original untouched  */
+    Fail   /* patch could not be produced (read/apply error)            */
+};
+
 /* ------------------------------------------------------------------------- */
 /* INI                                                                        */
 /* ------------------------------------------------------------------------- */
@@ -83,6 +116,8 @@ PHP_INI_BEGIN()
                       patch_file, zend_phpatcher_globals, phpatcher_globals)
     STD_PHP_INI_ENTRY("phpatcher.base_dir", "", PHP_INI_SYSTEM, OnUpdateString,
                       base_dir, zend_phpatcher_globals, phpatcher_globals)
+    STD_PHP_INI_ENTRY("phpatcher.on_error", "original", PHP_INI_SYSTEM, OnUpdateString,
+                      on_error, zend_phpatcher_globals, phpatcher_globals)
     STD_PHP_INI_BOOLEAN("phpatcher.enabled", "1", PHP_INI_SYSTEM, OnUpdateBool,
                         enabled, zend_phpatcher_globals, phpatcher_globals)
     STD_PHP_INI_BOOLEAN("phpatcher.strict", "1", PHP_INI_SYSTEM, OnUpdateBool,
@@ -91,15 +126,19 @@ PHP_INI_BEGIN()
                         precompute, zend_phpatcher_globals, phpatcher_globals)
     STD_PHP_INI_BOOLEAN("phpatcher.cache", "1", PHP_INI_SYSTEM, OnUpdateBool,
                         cache, zend_phpatcher_globals, phpatcher_globals)
+    STD_PHP_INI_BOOLEAN("phpatcher.opcache_bind", "1", PHP_INI_SYSTEM, OnUpdateBool,
+                        opcache_bind, zend_phpatcher_globals, phpatcher_globals)
 PHP_INI_END()
 
 static void php_phpatcher_globals_ctor(zend_phpatcher_globals *g) {
     g->patch_file = nullptr;
     g->base_dir = nullptr;
+    g->on_error = nullptr;
     g->enabled = true;
     g->strict = true;
     g->precompute = true;
     g->cache = true;
+    g->opcache_bind = true;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -126,7 +165,10 @@ static std::string_view phpatcher_basename(zend_file_handle *fh) {
     return slash == std::string_view::npos ? path : path.substr(slash + 1);
 }
 
-/* Resolve the file handle to a canonical absolute path string. */
+/* Resolve the file handle to a canonical absolute path string, using the same
+ * resolver the engine uses (zend_resolve_path + VCWD_REALPATH). The index keys
+ * are re-canonicalized through VCWD_REALPATH at MINIT too, so both sides agree
+ * regardless of symlinks, relative segments, or a case-insensitive filesystem. */
 static bool phpatcher_canonical_path(zend_file_handle *fh, std::string &out) {
     zend_string *resolved = nullptr;
     if (fh->opened_path) {
@@ -137,7 +179,12 @@ static bool phpatcher_canonical_path(zend_file_handle *fh, std::string &out) {
     if (!resolved) {
         return false;
     }
-    out = phpatcher::PatchSet::canonicalize(ZSTR_VAL(resolved), std::string());
+    char real[MAXPATHLEN];
+    if (VCWD_REALPATH(ZSTR_VAL(resolved), real)) {
+        out.assign(real);
+    } else {
+        out.assign(ZSTR_VAL(resolved), ZSTR_LEN(resolved));
+    }
     zend_string_release(resolved);
     return true;
 }
@@ -192,16 +239,29 @@ static void phpatcher_inject_source(zend_file_handle *fh, const std::string &con
     }
 }
 
-/* Produce the patched content for `path`, using the cache when enabled.
- * Returns true and fills `content` on success. */
-static bool phpatcher_get_patched(const std::string &path, const phpatcher::FilePatch &fp,
-                                  std::string &content) {
-    /* Lock-free fast path: content prepared at startup. */
+/* True if the source uses __halt_compiler(): the engine records a byte offset
+ * into the compiled buffer that later feeds raw reads of the on-disk file via
+ * __COMPILER_HALT_OFFSET__. Shifting the code would corrupt that data, so such
+ * files are compiled untouched rather than patched. */
+static bool phpatcher_has_halt_compiler(const std::string &src) {
+    return src.find("__halt_compiler") != std::string::npos;
+}
+
+/* Produce the patched content for `path`. On PatchStatus::Ok, `out` points at a
+ * stable buffer that outlives the call (precomputed/cache entry, or `owned`):
+ * the caller copies it once into the engine buffer. `owned` is scratch storage
+ * used only when the content is freshly produced. */
+static PatchStatus phpatcher_get_patched(const std::string &path,
+                                         const phpatcher::FilePatch &fp,
+                                         const std::string *&out, std::string &owned) {
+    /* Lock-free fast path: content prepared at startup. unordered_map element
+     * references stay valid for the life of the map (we never erase), so the
+     * pointer is safe to use after any lock is released. */
     if (g_precomputed) {
         auto it = g_precomputed->find(path);
         if (it != g_precomputed->end()) {
-            content = it->second;
-            return true;
+            out = &it->second;
+            return PatchStatus::Ok;
         }
     }
 
@@ -211,35 +271,72 @@ static bool phpatcher_get_patched(const std::string &path, const phpatcher::File
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         auto it = g_cache->find(path);
         if (it != g_cache->end()) {
-            content = it->second;
-            return true;
+            out = &it->second;
+            return PatchStatus::Ok;
         }
     }
 
     std::string original;
     if (!phpatcher::read_file(path, original)) {
+        g_read_failures.fetch_add(1, std::memory_order_relaxed);
+        phpatcher_record_error("cannot read original file '" + path + "'");
         if (PHPATCHER_G(strict)) {
             php_error_docref(nullptr, E_WARNING,
                              "phpatcher: cannot read original file '%s'", path.c_str());
         }
-        return false;
+        return PatchStatus::Fail;
+    }
+
+    if (phpatcher_has_halt_compiler(original)) {
+        g_skipped_halt.fetch_add(1, std::memory_order_relaxed);
+        if (PHPATCHER_G(strict)) {
+            php_error_docref(nullptr, E_WARNING,
+                             "phpatcher: skipping '%s' (__halt_compiler present; "
+                             "patching would shift its data offset)", path.c_str());
+        }
+        return PatchStatus::Skip;
     }
 
     std::string error;
-    if (!phpatcher::PatchSet::apply(fp, original, content, error)) {
+    if (!phpatcher::PatchSet::apply(fp, original, owned, error)) {
+        g_apply_failures.fetch_add(1, std::memory_order_relaxed);
+        phpatcher_record_error("patch did not apply to '" + path + "': " + error);
         if (PHPATCHER_G(strict)) {
             php_error_docref(nullptr, E_WARNING,
                              "phpatcher: patch did not apply to '%s': %s",
                              path.c_str(), error.c_str());
         }
-        return false;
+        return PatchStatus::Fail;
     }
 
     if (use_cache && g_cache) {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
-        (*g_cache)[path] = content;
+        std::string &slot = (*g_cache)[path];
+        slot = std::move(owned);
+        out = &slot;
+        return PatchStatus::Ok;
     }
-    return true;
+    out = &owned;
+    return PatchStatus::Ok;
+}
+
+/* Build the PHP stub compiled in place of a file whose patch did not take effect
+ * when phpatcher.on_error = "fail". `reason` explains why; both it and the path
+ * go into a single-quoted PHP string, so ' and \ are escaped. */
+static std::string phpatcher_fail_stub(const std::string &path, const std::string &reason) {
+    const auto escape = [](const std::string &s) {
+        std::string out;
+        out.reserve(s.size());
+        for (const char c : s) {
+            if (c == '\\' || c == '\'') {
+                out += '\\';
+            }
+            out += c;
+        }
+        return out;
+    };
+    return "<?php throw new \\RuntimeException('phpatcher: refusing to run "
+           "unpatched code for " + escape(path) + " (" + escape(reason) + ")');\n";
 }
 
 static zend_op_array *phpatcher_compile_file(zend_file_handle *file_handle, int type) {
@@ -252,11 +349,32 @@ static zend_op_array *phpatcher_compile_file(zend_file_handle *file_handle, int 
     if (eligible) {
         std::string path;
         if (const phpatcher::FilePatch *fp = phpatcher_resolve(file_handle, path)) {
-            std::string patched;
-            if (phpatcher_get_patched(path, *fp, patched)) {
-                phpatcher_inject_source(file_handle, patched, path);
+            const std::string *patched = nullptr;
+            std::string owned;
+            switch (phpatcher_get_patched(path, *fp, patched, owned)) {
+                case PatchStatus::Ok:
+                    phpatcher_inject_source(file_handle, *patched, path);
+                    break;
+                case PatchStatus::Fail:
+                    /* fail-closed: replace with a throwing stub so the unpatched
+                     * original never runs. Otherwise fall through to the original. */
+                    if (phpatcher_fail_closed()) {
+                        const std::string stub = phpatcher_fail_stub(path, "patch failed");
+                        phpatcher_inject_source(file_handle, stub, path);
+                    }
+                    break;
+                case PatchStatus::Skip:
+                    /* A requested patch we cannot safely apply (e.g.
+                     * __halt_compiler). Under fail-closed this is still "the
+                     * patch did not take effect", so refuse to run the original
+                     * rather than silently leaking unpatched code. */
+                    if (phpatcher_fail_closed()) {
+                        const std::string stub =
+                            phpatcher_fail_stub(path, "file cannot be patched (__halt_compiler)");
+                        phpatcher_inject_source(file_handle, stub, path);
+                    }
+                    break;
             }
-            /* On failure we fall through and compile the original (fail-safe). */
         }
     }
 
@@ -311,6 +429,10 @@ PHP_FUNCTION(phpatcher_stats) {
     add_assoc_bool(return_value, "strict", PHPATCHER_G(strict));
     add_assoc_bool(return_value, "precompute", PHPATCHER_G(precompute));
     add_assoc_bool(return_value, "cache", PHPATCHER_G(cache));
+    add_assoc_string(return_value, "on_error",
+                     PHPATCHER_G(on_error) ? PHPATCHER_G(on_error) : "original");
+    add_assoc_bool(return_value, "opcache_bind", PHPATCHER_G(opcache_bind));
+    add_assoc_stringl(return_value, "system_id", zend_system_id, sizeof(zend_system_id));
     add_assoc_long(return_value, "indexed_files",
                    g_patchset ? static_cast<zend_long>(g_patchset->file_count()) : 0);
 
@@ -330,6 +452,20 @@ PHP_FUNCTION(phpatcher_stats) {
     }
     add_assoc_long(return_value, "cached_files", cached_files);
     add_assoc_long(return_value, "cached_bytes", cached_bytes);
+
+    /* Failure observability: non-zero values mean a patch did not take effect,
+     * even if E_WARNING is silenced. */
+    add_assoc_long(return_value, "apply_failures",
+                   static_cast<zend_long>(g_apply_failures.load(std::memory_order_relaxed)));
+    add_assoc_long(return_value, "read_failures",
+                   static_cast<zend_long>(g_read_failures.load(std::memory_order_relaxed)));
+    add_assoc_long(return_value, "skipped_halt_compiler",
+                   static_cast<zend_long>(g_skipped_halt.load(std::memory_order_relaxed)));
+    {
+        std::lock_guard<std::mutex> lock(g_last_error_mutex);
+        add_assoc_string(return_value, "last_error",
+                         g_last_error.empty() ? "" : g_last_error.c_str());
+    }
 }
 
 static const zend_function_entry phpatcher_functions[] = {
@@ -364,8 +500,16 @@ static void phpatcher_precompute(const phpatcher::PatchSet &set) {
     }
     for (const auto &kv : set.files()) {
         std::string original, patched, error;
-        if (phpatcher::read_file(kv.first, original) &&
-            phpatcher::PatchSet::apply(kv.second, original, patched, error)) {
+        if (!phpatcher::read_file(kv.first, original)) {
+            continue;
+        }
+        /* Files with __halt_compiler() are never patched (see the runtime guard);
+         * keep them out of the precomputed map so the compile hook compiles the
+         * original untouched. */
+        if (phpatcher_has_halt_compiler(original)) {
+            continue;
+        }
+        if (phpatcher::PatchSet::apply(kv.second, original, patched, error)) {
             (*g_precomputed)[kv.first] = std::move(patched);
         }
     }
@@ -414,6 +558,35 @@ PHP_MINIT_FUNCTION(phpatcher) {
     }
 
     g_patchset = set;
+
+    /* Bind the patch's identity to OPcache's build id. zend_system_id is the
+     * "build ID" OPcache stamps into every cached script (SHM *and* the on-disk
+     * opcache.file_cache); an entry whose id does not match is treated as
+     * incompatible and recompiled. OPcache keys its freshness on the source
+     * file's mtime/size, which a patch does not change, so without this a changed
+     * patch would keep serving stale (pre-patch) opcodes from file_cache until
+     * the directory is wiped. Feeding the patch bytes (and base_dir, which
+     * selects which files match) into the system id makes any patch change
+     * invalidate the cache automatically — no touch, no manual cleanup. Must run
+     * before zend_finalize_system_id(), which the engine calls after MINIT. */
+    if (PHPATCHER_G(opcache_bind)) {
+        zend_add_system_entropy("phpatcher", "patch",
+                                diff_text.data(), diff_text.size());
+        const std::string base = phpatcher_base_dir();
+        zend_add_system_entropy("phpatcher", "base_dir", base.data(), base.size());
+    }
+
+    /* Re-key the index with the engine's own path resolver so the keys match the
+     * canonical paths PHP produces when it compiles an include (handles symlinks,
+     * relative segments and case-insensitive filesystems consistently). */
+    g_patchset->recanonicalize([](const std::string &p) -> std::string {
+        char real[MAXPATHLEN];
+        if (VCWD_REALPATH(p.c_str(), real)) {
+            return std::string(real);
+        }
+        return p;
+    });
+
     g_cache = new (std::nothrow) std::unordered_map<std::string, std::string>();
 
     /* Precompute patched content so the compile hook is a lock-free lookup +

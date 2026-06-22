@@ -54,8 +54,9 @@ in the patch pay only a single hash lookup — no `realpath()`, no I/O.
 
 ## Requirements
 
-- PHP 8.0+ (developed and tested against PHP 8.5). The `zend_file_handle.buf`
-  in-memory buffer mechanism this relies on exists since PHP 8.0.
+- A currently supported PHP: **8.2+** (developed and tested against PHP 8.5).
+  The `zend_file_handle.buf` in-memory buffer mechanism this relies on has been
+  stable across the 8.x series. CI runs the suite on 8.2, 8.3 and 8.4.
 - A C++17 compiler (clang or gcc).
 - `phpize` / `php-config` (the PHP development headers).
 
@@ -88,10 +89,15 @@ phpatcher.patch_file=/path/to/changes.patch
 phpatcher.base_dir=/path/to/project
 
 ; Optional toggles (all default as shown):
-phpatcher.enabled=1     ; master on/off switch
-phpatcher.strict=1      ; emit an E_WARNING when a patch fails to apply
-phpatcher.precompute=1  ; patch all targets at startup (shared via copy-on-write)
-phpatcher.cache=1       ; lazily cache patched contents per process
+phpatcher.enabled=1        ; master on/off switch
+phpatcher.strict=1         ; emit an E_WARNING when a patch fails to apply
+phpatcher.on_error=original ; "original" = compile the unpatched file on failure
+                            ; (fail-open); "fail" = compile a throwing stub so the
+                            ; unpatched code never runs (fail-closed)
+phpatcher.precompute=1     ; patch all targets at startup (shared via copy-on-write)
+phpatcher.cache=1          ; lazily cache patched contents per process
+phpatcher.opcache_bind=1   ; fold the patch identity into OPcache's build id so a
+                            ; changed patch auto-invalidates OPcache (SHM + file_cache)
 ```
 
 With no `phpatcher.patch_file` configured the extension installs no hook and
@@ -113,9 +119,11 @@ All settings are `PHP_INI_SYSTEM` (read once at startup, set them in `php.ini`).
 | `phpatcher.patch_file` | `""` | Path to the unified-diff file to apply. |
 | `phpatcher.base_dir` | CWD | Root used to resolve the patch's relative `a/`,`b/` paths to absolute files. |
 | `phpatcher.enabled` | `1` | Master switch. When `0`, no hook is installed. |
-| `phpatcher.strict` | `1` | When `1`, a patch that does not cleanly apply (or whose file cannot be read) emits an `E_WARNING`. In all cases phpatcher *fails safe*: the original, unmodified file is compiled. |
+| `phpatcher.strict` | `1` | When `1`, a patch that does not cleanly apply (or whose file cannot be read) emits an `E_WARNING`. |
+| `phpatcher.on_error` | `original` | What to compile when a patch does not apply. `original` (default) compiles the unmodified file — *fail-open*: convenient, but a patch meant to close a vulnerability silently leaves the original code running. `fail` compiles a stub that throws a `RuntimeException` — *fail-closed*: the unpatched code never runs. Use `fail` for security hotfixes. Either way the on-disk file is never modified, and failures are counted in `phpatcher_stats()`. |
 | `phpatcher.precompute` | `1` | Patch **every** indexed file once at `MINIT`. Under a forking SAPI (php-fpm, Apache prefork) this happens in the master, so the result is shared with all workers via copy-on-write — paid once for the whole pool. The compile hook then becomes a lock-free lookup. See [Memory model](#memory-model-php-fpm). |
 | `phpatcher.cache` | `1` | Lazily cache patched output for files that were *not* precomputed (e.g. created after startup, or when `precompute=0`). This cache is **per process**, so it is not shared across an fpm pool. |
+| `phpatcher.opcache_bind` | `1` | Mix the patch's bytes (and `base_dir`) into Zend's `system_id` — the build id OPcache stamps into every cached script. Changing the patch then changes the build id, so OPcache automatically treats its cached scripts (both SHM and the on-disk `opcache.file_cache`) as incompatible and recompiles them through phpatcher. This removes the need to wipe the file-cache directory after changing the patch. Set to `0` to opt out (e.g. if you manage cache invalidation yourself). |
 
 To minimise resident memory at the cost of CPU on cold compiles, set both
 `phpatcher.precompute=0` and `phpatcher.cache=0`: each file is then patched on the
@@ -186,14 +194,30 @@ tested against both (see `tests/008-opcache-jit.phpt`).
   forces the JIT off (only extensions that hook execution, such as coverage
   tools like pcov/Xdebug, do that — independently of phpatcher).
 
-> **Operational note:** OPcache keys its cache by the *source file* (path +
-> mtime/size), not by the patch. If you change `phpatcher.patch_file` while the
-> source files on disk stay the same, OPcache will keep serving the previously
-> cached version. Reset OPcache (`opcache_reset()`, or restart PHP-FPM) after
-> changing the patch. Editing a source file invalidates its entry normally and
-> it is re-patched on the next compile. The same applies to `opcache.file_cache`:
-> clear the on-disk cache directory when you change or first enable the patch, or
-> it may load pre-patch opcodes from a previous run.
+> **Operational note (changing the patch):** OPcache keys its *freshness* check on
+> the source file's mtime/size, which a patch does not change. By default
+> phpatcher closes this gap with `phpatcher.opcache_bind` (see the configuration
+> table): it folds the patch's bytes into Zend's `system_id`, the build id OPcache
+> stamps into every cached script. When you change the patch, the build id
+> changes, so OPcache treats **both** its SHM cache and the on-disk
+> `opcache.file_cache` as incompatible and recompiles through phpatcher. No manual
+> step is required — just deploy the new patch and restart the SAPI (required
+> anyway, since `phpatcher.patch_file` is `PHP_INI_SYSTEM` and read once at
+> `MINIT`).
+>
+> If you set `phpatcher.opcache_bind=0`, you are back to manual invalidation, and
+> it is worth knowing exactly what works (all verified):
+>
+> - A real SAPI **restart** recreates the (anonymous) SHM segment, so the SHM
+>   cache comes up fresh on its own.
+> - The on-disk **`opcache.file_cache` survives a restart** and is **not** cleared
+>   by `opcache_reset()`, `opcache_invalidate()` *or* `opcache_compile_file()` —
+>   they all act on SHM and consider the file-cache entry valid because the source
+>   timestamp is unchanged. You must either delete the file-cache directory or
+>   `touch` the patched source files (changing their mtime forces a recompile).
+>
+> Editing a *source* file invalidates its entry normally (timestamp change) and
+> it is re-patched on the next compile.
 
 ### Load order
 
@@ -234,9 +258,25 @@ CPU for memory, see the `precompute`/`cache` knobs above.
 
 ## Behaviour & guarantees
 
-- **Fail-safe.** If a patch does not apply (e.g. the source has changed and the
-  context no longer matches), phpatcher compiles the *original* file and (in
-  strict mode) emits a warning. It never produces a broken hybrid.
+- **Never a broken hybrid.** If a patch does not apply (e.g. the source has
+  changed and the context no longer matches), phpatcher never produces a
+  partially-patched file. With `phpatcher.on_error=original` (default) it
+  compiles the *original* file (fail-open); with `phpatcher.on_error=fail` it
+  compiles a throwing stub so the unpatched code does not run (fail-closed). In
+  strict mode it also emits a warning, and every failure is counted (see
+  `phpatcher_stats()`), so a drifted patch is observable even when warnings are
+  silenced in production.
+- **`__halt_compiler()` files are left untouched.** Such files embed a byte
+  offset into the compiled source that later feeds raw reads of the on-disk file
+  (`__COMPILER_HALT_OFFSET__`). Patching would shift that offset and corrupt the
+  trailing data, so phpatcher refuses to patch them. In strict mode it emits a
+  warning and counts them as `skipped_halt_compiler`. This counts as "the patch
+  did not take effect", so it follows `phpatcher.on_error`: `original` compiles
+  the unmodified file, `fail` compiles the throwing stub.
+- **Engine-aligned path resolution.** Index keys are canonicalized with the same
+  resolver PHP uses for includes (`VCWD_REALPATH`), so symlinks, relative
+  segments and case-insensitive filesystems resolve consistently between the
+  index and the file the engine actually compiles.
 - **Only listed files are touched.** Any file not present in the patch index is
   compiled completely untouched (zero overhead beyond a hash-map lookup).
 - **Thread-safe.** The patch index is immutable after startup; the patched-output
@@ -254,20 +294,30 @@ phpatcher_stats(): array      // runtime counters (see below)
 
 ```php
 [
-    'active'            => true,   // hook installed
-    'strict'            => true,
-    'precompute'        => true,
-    'cache'             => true,
-    'indexed_files'     => 12,     // files named in the patch
-    'precomputed_files' => 12,     // patched at startup (shared via copy-on-write)
-    'precomputed_bytes' => 348160, // shared footprint, paid once per fpm pool
-    'cached_files'      => 0,      // lazily patched in this worker (per process)
-    'cached_bytes'      => 0,
+    'active'                => true,   // hook installed
+    'strict'                => true,
+    'precompute'            => true,
+    'cache'                 => true,
+    'on_error'              => 'original', // or 'fail' (fail-closed)
+    'opcache_bind'          => true,   // patch identity folded into system_id
+    'system_id'             => '...',  // Zend build id (changes when the patch does)
+    'indexed_files'         => 12,     // files named in the patch
+    'precomputed_files'     => 12,     // patched at startup (shared via copy-on-write)
+    'precomputed_bytes'     => 348160, // shared footprint, paid once per fpm pool
+    'cached_files'          => 0,      // lazily patched in this worker (per process)
+    'cached_bytes'          => 0,
+    'apply_failures'        => 0,      // patches that did not cleanly apply
+    'read_failures'         => 0,      // target files that could not be read
+    'skipped_halt_compiler' => 0,      // files skipped because of __halt_compiler()
+    'last_error'            => '',     // most recent failure message
 ]
 ```
 
 Use `precomputed_bytes` to size the shared cost and `cached_bytes` to watch
-per-worker growth. `phpinfo()` / `php --ri phpatcher` also report the version,
+per-worker growth. Watch `apply_failures` / `read_failures` (and `last_error`)
+to detect a patch that has silently stopped applying — e.g. after a vendor
+update shifted the context — especially when `display_errors`/logging would hide
+the `E_WARNING`. `phpinfo()` / `php --ri phpatcher` also report the version,
 active state, indexed file count and the precomputed file count and byte size.
 
 ## Security considerations
@@ -290,7 +340,13 @@ active state, indexed file count and the precomputed file count and byte size.
   files (`--- /dev/null`) are not served, since such a file cannot be `include`d
   from disk in the first place.
 - Patch application is strict (no fuzz): the hunk context must match the original
-  file exactly, just like `git apply` without fuzzing.
+  file exactly, just like `git apply` without fuzzing. A cosmetic change to the
+  source (whitespace, line endings) is enough to make a hunk stop applying.
+- Files using `__halt_compiler()` are never patched (their data offset cannot be
+  preserved); they compile untouched.
+- The code that runs is the patched buffer, not the bytes on disk, so reported
+  line numbers (errors, stack traces, debuggers) refer to the patched source.
+  Keep hunks line-count-neutral where you can to limit the drift.
 
 ## Project layout
 

@@ -333,10 +333,30 @@ bool read_file(const std::string& path, std::string& out) {
     return true;
 }
 
-void PatchSet::add_file(FilePatch&& fp) {
+bool PatchSet::add_file(FilePatch&& fp, std::string& error) {
+    if (index_.find(fp.target_path) != index_.end()) {
+        error = "duplicate patch section for " + fp.target_path;
+        return false;
+    }
     basenames_.insert(basename_of(fp.target_path));
     std::string key = fp.target_path;
     index_[std::move(key)] = std::move(fp);
+    return true;
+}
+
+void PatchSet::recanonicalize(const std::function<std::string(const std::string&)>& fn) {
+    std::unordered_map<std::string, FilePatch> rebuilt;
+    std::unordered_set<std::string> bn;
+    rebuilt.reserve(index_.size());
+    for (auto& kv : index_) {
+        FilePatch fp = std::move(kv.second);
+        std::string canon = fn(fp.target_path);
+        fp.target_path = canon;
+        bn.insert(basename_of(canon));
+        rebuilt[std::move(canon)] = std::move(fp);
+    }
+    index_ = std::move(rebuilt);
+    basenames_ = std::move(bn);
 }
 
 bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, std::string& error) {
@@ -358,13 +378,16 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
     long need_orig = 0;  /* original-side body lines still expected by active_hunk */
     long need_new = 0;   /* new-side body lines still expected by active_hunk      */
 
-    const auto flush_current = [&]() {
+    const auto flush_current = [&]() -> bool {
         if (have_current && !current.hunks.empty()) {
-            add_file(std::move(current));
+            if (!add_file(std::move(current), error)) {
+                return false;
+            }
         }
         current = FilePatch();
         have_current = false;
         active_hunk = nullptr;
+        return true;
     };
 
     const auto begin_file = [&]() -> bool {
@@ -378,7 +401,9 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
             error = "diff hunk without a usable target file path";
             return false;
         }
-        flush_current();
+        if (!flush_current()) {
+            return false;
+        }
         current.diff_old_path = pending_old;
         current.diff_new_path = pending_new;
         current.target_path = canonicalize(std::string(chosen), base_dir);
@@ -457,7 +482,9 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
          * mode, rename/copy, binary markers, ...) and is ignored. */
     }
 
-    flush_current();
+    if (!flush_current()) {
+        return false;
+    }
     return true;  /* an empty diff (no hunks) is a valid no-op */
 }
 
@@ -473,13 +500,16 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
     EdCommand pending;
     bool in_input = false;
 
-    const auto flush_current = [&]() {
+    const auto flush_current = [&]() -> bool {
         if (have_current && !current.ed.empty()) {
-            add_file(std::move(current));
+            if (!add_file(std::move(current), error)) {
+                return false;
+            }
         }
         current = FilePatch();
         current.is_ed = true;
         have_current = false;
+        return true;
     };
 
     for (const string_view line : lines) {
@@ -502,7 +532,9 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
                 error = "empty '# file:' header in ed bundle";
                 return false;
             }
-            flush_current();
+            if (!flush_current()) {
+                return false;
+            }
             const std::string clean(path.substr(s));
             current.target_path = canonicalize(clean, base_dir);
             current.diff_new_path = clean;
@@ -545,7 +577,9 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
         return false;
     }
 
-    flush_current();
+    if (!flush_current()) {
+        return false;
+    }
     return true;  /* a bundle with no file sections is a valid no-op */
 }
 

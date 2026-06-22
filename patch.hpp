@@ -7,6 +7,7 @@
 #ifndef PHPATCHER_PATCH_HPP
 #define PHPATCHER_PATCH_HPP
 
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -114,14 +115,25 @@ public:
     [[nodiscard]] static std::string canonicalize(const std::string& path,
                                                   const std::string& base_dir);
 
+    /*
+     * Re-key every indexed file through `fn` (and rebuild the basename filter).
+     * The extension uses this to re-canonicalize the index with the *engine's*
+     * path resolver (VCWD_REALPATH) after parse(), so the index keys match the
+     * canonical paths PHP produces for includes. Keeping it here lets patch.cpp
+     * stay free of any PHP/Zend dependency while the glue supplies the resolver.
+     */
+    void recanonicalize(const std::function<std::string(const std::string&)>& fn);
+
 private:
     /* Parse our ed-script bundle format (see README). Selected automatically by
      * parse() when the input begins with the "# phpatcher-ed" magic line. */
     bool parse_ed_bundle(const std::string& diff_text, const std::string& base_dir,
                          std::string& error);
 
-    /* Insert a fully-built file patch into the index and basename filter. */
-    void add_file(FilePatch&& fp);
+    /* Insert a fully-built file patch into the index and basename filter.
+     * Returns false (and fills `error`) if another section already targets the
+     * same canonical path, so a duplicate never silently overwrites the first. */
+    bool add_file(FilePatch&& fp, std::string& error);
 
     std::unordered_map<std::string, FilePatch> index_;
     std::unordered_set<std::string> basenames_;  /* basenames of indexed targets */
