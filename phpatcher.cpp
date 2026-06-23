@@ -76,6 +76,10 @@ static std::unordered_map<std::string, std::string> *g_precomputed = nullptr;
 static std::unordered_map<std::string, std::string> *g_cache = nullptr;
 static std::mutex g_cache_mutex;
 
+/* Base directory the patch's relative paths (and corpus references) resolve
+ * against; computed once in MINIT and read-only afterwards. */
+static std::string g_base_dir;
+
 /* Previous compile_file handler in the chain (e.g. OPcache). */
 static zend_op_array *(*phpatcher_orig_compile_file)(zend_file_handle *, int) = nullptr;
 
@@ -247,6 +251,88 @@ static bool phpatcher_has_halt_compiler(const std::string &src) {
     return src.find("__halt_compiler") != std::string::npos;
 }
 
+/* Split file content into lines with the trailing newline (and a single
+ * preceding CR) removed — the exact representation the corpus matcher hashed,
+ * so the reference verification hash agrees byte-for-byte. */
+static std::vector<std::string> phpatcher_split_lines(const std::string &content) {
+    std::vector<std::string> lines;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < content.size(); ++i) {
+        if (content[i] == '\n') {
+            std::size_t end = i;
+            if (end > start && content[end - 1] == '\r') --end;
+            lines.emplace_back(content.substr(start, end - start));
+            start = i + 1;
+        }
+    }
+    if (start < content.size()) lines.emplace_back(content.substr(start));
+    return lines;
+}
+
+/* Per-apply cache of corpus files read for reference resolution: path -> (ok, lines). */
+using RefCache = std::unordered_map<std::string, std::pair<bool, std::vector<std::string>>>;
+
+/* Build a reference resolver bound to `base_dir` and `cache`. It reads the
+ * referenced file, validates the line range, and verifies the content hash so a
+ * drifted corpus is rejected instead of silently producing wrong code. */
+static phpatcher::PatchSet::RefResolver phpatcher_make_resolver(const std::string &base_dir,
+                                                               RefCache &cache) {
+    return [base_dir, &cache](const phpatcher::EdRef &ref, std::vector<std::string> &out,
+                              std::string &error) -> bool {
+        const std::string full =
+            (!ref.path.empty() && ref.path[0] == '/') ? ref.path : base_dir + "/" + ref.path;
+
+        auto it = cache.find(full);
+        if (it == cache.end()) {
+            std::string content;
+            std::pair<bool, std::vector<std::string>> entry;
+            entry.first = phpatcher::read_file(full, content);
+            if (entry.first) entry.second = phpatcher_split_lines(content);
+            it = cache.emplace(full, std::move(entry)).first;
+        }
+        if (!it->second.first) {
+            error = "cannot read referenced file '" + full + "'";
+            return false;
+        }
+
+        const std::vector<std::string> &lines = it->second.second;
+        const auto count = static_cast<std::int64_t>(lines.size());
+        if (ref.begin < 1 || ref.end < ref.begin || ref.end > count) {
+            error = "referenced range " + std::to_string(ref.begin) + "," +
+                    std::to_string(ref.end) + " out of range in '" + ref.path + "'";
+            return false;
+        }
+
+        /* Verify whatever guard the patch carries: the byte length (cheap
+         * default) or, for the paranoid, the content hash. The hash is computed
+         * only when actually requested, so the common path does no hashing. */
+        std::string bytes;  /* materialized only when a hash check is needed */
+        std::int64_t total = 0;
+        out.clear();
+        out.reserve(static_cast<std::size_t>(ref.end - ref.begin + 1));
+        for (std::int64_t ln = ref.begin; ln <= ref.end; ++ln) {
+            const std::string &l = lines[static_cast<std::size_t>(ln - 1)];
+            total += static_cast<std::int64_t>(l.size()) + 1;
+            if (ref.has_hash) {
+                bytes.append(l);
+                bytes.push_back('\n');
+            }
+            out.push_back(l);
+        }
+        if (ref.bytes >= 0 && total != ref.bytes) {
+            out.clear();
+            error = "referenced content in '" + ref.path + "' has changed (length mismatch)";
+            return false;
+        }
+        if (ref.has_hash && phpatcher::ref_hash(bytes) != ref.hash) {
+            out.clear();
+            error = "referenced content in '" + ref.path + "' has changed (hash mismatch)";
+            return false;
+        }
+        return true;
+    };
+}
+
 /* Produce the patched content for `path`. On PatchStatus::Ok, `out` points at a
  * stable buffer that outlives the call (precomputed/cache entry, or `owned`):
  * the caller copies it once into the engine buffer. `owned` is scratch storage
@@ -298,7 +384,9 @@ static PatchStatus phpatcher_get_patched(const std::string &path,
     }
 
     std::string error;
-    if (!phpatcher::PatchSet::apply(fp, original, owned, error)) {
+    RefCache refcache;
+    if (!phpatcher::PatchSet::apply(fp, original, owned, error,
+                                    phpatcher_make_resolver(g_base_dir, refcache))) {
         g_apply_failures.fetch_add(1, std::memory_order_relaxed);
         phpatcher_record_error("patch did not apply to '" + path + "': " + error);
         if (PHPATCHER_G(strict)) {
@@ -498,6 +586,10 @@ static void phpatcher_precompute(const phpatcher::PatchSet &set) {
     if (g_precomputed == nullptr) {
         return;
     }
+    /* One reference cache for the whole warm-up: a corpus file referenced by
+     * several patched files is read and verified once. */
+    RefCache refcache;
+    const phpatcher::PatchSet::RefResolver resolver = phpatcher_make_resolver(g_base_dir, refcache);
     for (const auto &kv : set.files()) {
         std::string original, patched, error;
         if (!phpatcher::read_file(kv.first, original)) {
@@ -509,7 +601,7 @@ static void phpatcher_precompute(const phpatcher::PatchSet &set) {
         if (phpatcher_has_halt_compiler(original)) {
             continue;
         }
-        if (phpatcher::PatchSet::apply(kv.second, original, patched, error)) {
+        if (phpatcher::PatchSet::apply(kv.second, original, patched, error, resolver)) {
             (*g_precomputed)[kv.first] = std::move(patched);
         }
     }
@@ -541,8 +633,10 @@ PHP_MINIT_FUNCTION(phpatcher) {
         return SUCCESS;
     }
 
+    g_base_dir = phpatcher_base_dir();
+
     std::string error;
-    if (!set->parse(diff_text, phpatcher_base_dir(), error)) {
+    if (!set->parse(diff_text, g_base_dir, error)) {
         php_error_docref(nullptr, E_WARNING,
                          "phpatcher: failed to parse patch '%s': %s",
                          patch_file, error.c_str());
@@ -572,8 +666,7 @@ PHP_MINIT_FUNCTION(phpatcher) {
     if (PHPATCHER_G(opcache_bind)) {
         zend_add_system_entropy("phpatcher", "patch",
                                 diff_text.data(), diff_text.size());
-        const std::string base = phpatcher_base_dir();
-        zend_add_system_entropy("phpatcher", "base_dir", base.data(), base.size());
+        zend_add_system_entropy("phpatcher", "base_dir", g_base_dir.data(), g_base_dir.size());
     }
 
     /* Re-key the index with the engine's own path resolver so the keys match the
@@ -619,6 +712,7 @@ PHP_MSHUTDOWN_FUNCTION(phpatcher) {
     g_precomputed = nullptr;
     delete g_cache;
     g_cache = nullptr;
+    g_base_dir.clear();
 
     UNREGISTER_INI_ENTRIES();
     return SUCCESS;

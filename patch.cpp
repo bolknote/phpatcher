@@ -17,10 +17,12 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string_view>
+#include <variant>
 
 namespace phpatcher {
 namespace {
@@ -217,14 +219,142 @@ bool parse_ed_command(string_view line, EdCommand& cmd, bool& needs_input) {
     }
 }
 
-/* Apply an ed-script FilePatch to `original`. */
-bool apply_ed_script(const FilePatch& fp, string_view original,
-                     std::string& out, std::string& error) {
+/* Parse a whole string_view as a non-negative decimal. Returns false unless the
+ * entire token is digits and fits in int64. */
+bool parse_decimal_full(string_view s, std::int64_t& out) {
+    if (s.empty()) return false;
+    std::int64_t v = 0;
+    for (const char c : s) {
+        if (c < '0' || c > '9') return false;
+        if (v > (INT64_MAX - (c - '0')) / 10) return false;  /* overflow */
+        v = v * 10 + (c - '0');
+    }
+    out = v;
+    return true;
+}
+
+/* Parse one ed input-block line into a piece. A line is treated as a corpus
+ * reference only if it fully matches
+ *
+ *     !sed -n 'A,B p[;B q]' PATH  # <guard>
+ *
+ * The optional ";B q" (sed early-exit) is accepted but ignored — phpatcher
+ * slices the file itself and never runs sed. <guard> is space-separated
+ * key:value tokens, at least one of which must be "s:<len>" (byte length) or
+ * "h:<32 hex>" (content hash). Anything that deviates (including ordinary code
+ * that merely starts with "!sed") is kept verbatim as a literal line. */
+EdPiece parse_ed_input_piece(string_view line) {
+    constexpr string_view kRefPrefix = "!sed -n '";
+    constexpr string_view kMetaIntro = "# ";
+
+    const auto literal = [&]() { return EdPiece(std::string(line)); };
+
+    if (line.substr(0, kRefPrefix.size()) != kRefPrefix) return literal();
+    std::size_t pos = kRefPrefix.size();
+
+    std::int64_t begin = 0, end = 0;
+    if (!read_uint(line, pos, begin)) return literal();
+    if (pos >= line.size() || line[pos] != ',') return literal();
+    ++pos;
+    if (!read_uint(line, pos, end)) return literal();
+
+    /* The sed script up to the closing quote: " p" with an optional ";<n> q". */
+    const std::size_t quote = line.find('\'', pos);
+    if (quote == npos) return literal();
+    {
+        string_view body = line.substr(pos, quote - pos);
+        if (body.substr(0, 2) != " p") return literal();
+        body.remove_prefix(2);
+        if (!body.empty()) {
+            if (body.front() != ';') return literal();
+            body.remove_prefix(1);
+            std::size_t d = 0;
+            while (d < body.size() && body[d] >= '0' && body[d] <= '9') ++d;
+            if (d == 0) return literal();
+            body.remove_prefix(d);
+            if (body != " q") return literal();
+        }
+    }
+    pos = quote + 1;
+    if (pos >= line.size() || line[pos] != ' ') return literal();
+    ++pos;
+
+    const string_view rest = line.substr(pos);
+    const std::size_t marker = rest.rfind(kMetaIntro);
+    if (marker == npos) return literal();
+
+    string_view path = rest.substr(0, marker);
+    while (!path.empty() && path.back() == ' ') path.remove_suffix(1);
+    if (path.empty() || begin < 1 || end < begin) return literal();
+
+    /* Parse the guard tokens. */
+    EdRef ref;
+    ref.path = std::string(path);
+    ref.begin = begin;
+    ref.end = end;
+
+    string_view meta = rest.substr(marker + kMetaIntro.size());
+    bool have_guard = false;
+    while (!meta.empty()) {
+        const std::size_t sp = meta.find(' ');
+        const string_view tok = meta.substr(0, sp);
+        if (tok.substr(0, 2) == "s:") {
+            if (!parse_decimal_full(tok.substr(2), ref.bytes)) return literal();
+            have_guard = true;
+        } else if (tok.substr(0, 2) == "h:") {
+            if (!ref_hash_parse(tok.substr(2), ref.hash)) return literal();
+            ref.has_hash = true;
+            have_guard = true;
+        } else if (!tok.empty()) {
+            return literal();  /* unknown token: not our directive */
+        }
+        if (sp == npos) break;
+        meta.remove_prefix(sp + 1);
+    }
+    if (!have_guard) return literal();
+
+    return EdPiece(std::move(ref));
+}
+
+/* Expand an ed input block into concrete line views. Literal pieces reference
+ * the patch's own storage; resolved reference pieces are owned by `storage`
+ * (a deque, so the views stay valid as more are appended). */
+bool build_input(const std::vector<EdPiece>& input, const PatchSet::RefResolver& resolve,
+                 std::deque<std::string>& storage, std::vector<string_view>& out,
+                 std::string& error) {
+    for (const EdPiece& piece : input) {
+        if (const std::string* lit = std::get_if<std::string>(&piece)) {
+            out.emplace_back(*lit);
+            continue;
+        }
+        const EdRef& ref = std::get<EdRef>(piece);
+        if (!resolve) {
+            error = "patch references corpus lines but no resolver is available";
+            return false;
+        }
+        std::vector<std::string> resolved;
+        if (!resolve(ref, resolved, error)) {
+            return false;
+        }
+        for (std::string& l : resolved) {
+            storage.push_back(std::move(l));
+            out.emplace_back(storage.back());
+        }
+    }
+    return true;
+}
+
+/* Apply an ed-script FilePatch to `original`. Corpus references are expanded via
+ * `resolve`; an ed script without references does not need one. */
+bool apply_ed_script(const FilePatch& fp, string_view original, std::string& out,
+                     std::string& error, const PatchSet::RefResolver& resolve) {
     bool ends_nl = false;
     std::vector<string_view> lines = split_lines(original, ends_nl);
     if (original.empty()) {
         ends_nl = true;  /* a file built from nothing should be newline-terminated */
     }
+
+    std::deque<std::string> storage;  /* owns resolved reference lines */
 
     const auto out_of_range = [&](const char* what) {
         error = what;
@@ -245,24 +375,32 @@ bool apply_ed_script(const FilePatch& fp, string_view original,
                 if (c.start < 1 || c.end < c.start || c.end > size) {
                     return out_of_range("ed change out of range");
                 }
+                std::vector<string_view> ins;
+                if (!build_input(c.input, resolve, storage, ins, error)) return false;
                 auto at = lines.erase(lines.begin() + (c.start - 1), lines.begin() + c.end);
-                lines.insert(at, c.lines.begin(), c.lines.end());
+                lines.insert(at, ins.begin(), ins.end());
                 break;
             }
 
-            case EdCommand::Append:
+            case EdCommand::Append: {
                 if (c.start < 0 || c.start > size) {
                     return out_of_range("ed append out of range");
                 }
-                lines.insert(lines.begin() + c.start, c.lines.begin(), c.lines.end());
+                std::vector<string_view> ins;
+                if (!build_input(c.input, resolve, storage, ins, error)) return false;
+                lines.insert(lines.begin() + c.start, ins.begin(), ins.end());
                 break;
+            }
 
-            case EdCommand::Insert:
+            case EdCommand::Insert: {
                 if (c.start < 1 || c.start > size + 1) {
                     return out_of_range("ed insert out of range");
                 }
-                lines.insert(lines.begin() + (c.start - 1), c.lines.begin(), c.lines.end());
+                std::vector<string_view> ins;
+                if (!build_input(c.input, resolve, storage, ins, error)) return false;
+                lines.insert(lines.begin() + (c.start - 1), ins.begin(), ins.end());
                 break;
+            }
         }
     }
 
@@ -530,7 +668,7 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
                 pending = EdCommand();
                 in_input = false;
             } else {
-                pending.lines.emplace_back(line);
+                pending.input.push_back(parse_ed_input_piece(line));
             }
             continue;
         }
@@ -604,9 +742,9 @@ bool PatchSet::has_basename(std::string_view basename) const {
 }
 
 bool PatchSet::apply(const FilePatch& fp, const std::string& original,
-                     std::string& out, std::string& error) {
+                     std::string& out, std::string& error, const RefResolver& resolve) {
     if (fp.is_ed()) {
-        return apply_ed_script(fp, original, out, error);
+        return apply_ed_script(fp, original, out, error, resolve);
     }
 
     bool orig_ends_nl = false;

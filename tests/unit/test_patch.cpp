@@ -9,6 +9,8 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
 #include <unistd.h>
 
 using phpatcher::FilePatch;
@@ -752,6 +754,227 @@ static void test_basename_of() {
     CHECK_EQ(PatchSet::basename_of(""), std::string(""));
 }
 
+/* ---- corpus references (ed "!sed" directives) ---------------------------- */
+
+/* A resolver backed by an in-memory corpus, mirroring the real glue: it
+ * validates the range and verifies whichever guard the reference carries — the
+ * byte length (s:) or the content hash (h:). */
+static phpatcher::PatchSet::RefResolver make_test_resolver(
+    const std::unordered_map<std::string, std::vector<std::string>> &corpus) {
+    return [&corpus](const phpatcher::EdRef &ref, std::vector<std::string> &out,
+                     std::string &error) -> bool {
+        auto it = corpus.find(ref.path);
+        if (it == corpus.end()) { error = "no such file"; return false; }
+        const std::vector<std::string> &lines = it->second;
+        if (ref.begin < 1 || ref.end < ref.begin ||
+            ref.end > static_cast<std::int64_t>(lines.size())) {
+            error = "range out of bounds";
+            return false;
+        }
+        std::string bytes;
+        std::int64_t total = 0;
+        out.clear();
+        for (std::int64_t ln = ref.begin; ln <= ref.end; ++ln) {
+            const std::string &l = lines[static_cast<std::size_t>(ln - 1)];
+            total += static_cast<std::int64_t>(l.size()) + 1;
+            if (ref.has_hash) { bytes += l; bytes += '\n'; }
+            out.push_back(l);
+        }
+        if (ref.bytes >= 0 && total != ref.bytes) { error = "length mismatch"; out.clear(); return false; }
+        if (ref.has_hash && phpatcher::ref_hash(bytes) != ref.hash) {
+            error = "hash mismatch";
+            out.clear();
+            return false;
+        }
+        return true;
+    };
+}
+
+/* Build a "!sed -n 'a,b p;b q' path  # s:LEN" directive (length guard, default)
+ * for the given exact bytes. */
+static std::string ref_directive(const std::string &path, int a, int b, const std::string &bytes) {
+    return "!sed -n '" + std::to_string(a) + "," + std::to_string(b) + " p;" +
+           std::to_string(b) + " q' " + path + "  # s:" + std::to_string(bytes.size());
+}
+
+/* Build a "!sed -n 'a,b p;b q' path  # h:HASH" directive (hash guard). */
+static std::string ref_directive_hash(const std::string &path, int a, int b,
+                                      const std::string &bytes) {
+    return "!sed -n '" + std::to_string(a) + "," + std::to_string(b) + " p;" +
+           std::to_string(b) + " q' " + path +
+           "  # h:" + phpatcher::ref_hash_hex(phpatcher::ref_hash(bytes));
+}
+
+static bool run_patch_ref(const std::string &relpath, const std::string &original,
+                          const std::string &diff, const phpatcher::PatchSet::RefResolver &resolve,
+                          std::string &out, std::string &err) {
+    const std::string abs = g_tmpdir + "/" + relpath;
+    write_file(abs, original);
+    PatchSet ps;
+    std::string perr;
+    if (!ps.parse(diff, g_tmpdir, perr)) { err = "parse failed: " + perr; return false; }
+    const FilePatch *fp = ps.find(PatchSet::canonicalize(relpath, g_tmpdir));
+    if (!fp) { err = "patch not found"; return false; }
+    return PatchSet::apply(*fp, original, out, err, resolve);
+}
+
+static void test_ed_reference_resolves() {
+    std::unordered_map<std::string, std::vector<std::string>> corpus = {
+        {"src/x.php", {"A", "B", "C"}}};
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: ref1.php\n"
+        "0a\n" +
+        ref_directive("src/x.php", 1, 3, "A\nB\nC\n") + "\n"
+        ".\n";
+    std::string out, err;
+    CHECK(run_patch_ref("ref1.php", "orig\n", diff, make_test_resolver(corpus), out, err));
+    CHECK_EQ(out, std::string("A\nB\nC\norig\n"));
+}
+
+static void test_ed_reference_mixed_with_literal() {
+    std::unordered_map<std::string, std::vector<std::string>> corpus = {
+        {"src/x.php", {"A", "B", "C"}}};
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: ref2.php\n"
+        "0a\n" +
+        ref_directive("src/x.php", 1, 2, "A\nB\n") + "\n"
+        "LITERAL\n"
+        ".\n";
+    std::string out, err;
+    CHECK(run_patch_ref("ref2.php", "orig\n", diff, make_test_resolver(corpus), out, err));
+    CHECK_EQ(out, std::string("A\nB\nLITERAL\norig\n"));
+}
+
+static void test_ed_reference_length_mismatch_fails() {
+    std::unordered_map<std::string, std::vector<std::string>> corpus = {
+        {"src/x.php", {"A", "B", "C"}}};
+    /* s: encodes a length that does not match the corpus content. */
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: ref3.php\n"
+        "0a\n" +
+        ref_directive("src/x.php", 1, 2, "WRONGER\nBYTES\n") + "\n"
+        ".\n";
+    std::string out, err;
+    CHECK(!run_patch_ref("ref3.php", "orig\n", diff, make_test_resolver(corpus), out, err));
+}
+
+static void test_ed_reference_hash_resolves() {
+    std::unordered_map<std::string, std::vector<std::string>> corpus = {
+        {"src/x.php", {"A", "B", "C"}}};
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: ref3h.php\n"
+        "0a\n" +
+        ref_directive_hash("src/x.php", 1, 3, "A\nB\nC\n") + "\n"
+        ".\n";
+    std::string out, err;
+    CHECK(run_patch_ref("ref3h.php", "orig\n", diff, make_test_resolver(corpus), out, err));
+    CHECK_EQ(out, std::string("A\nB\nC\norig\n"));
+}
+
+static void test_ed_reference_hash_mismatch_fails() {
+    std::unordered_map<std::string, std::vector<std::string>> corpus = {
+        {"src/x.php", {"A", "B", "C"}}};
+    /* Same byte length as the corpus run ("A\nB\n"), different content: a length
+     * guard would pass here, but the hash guard catches it. */
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: ref3m.php\n"
+        "0a\n" +
+        ref_directive_hash("src/x.php", 1, 2, "X\nY\n") + "\n"
+        ".\n";
+    std::string out, err;
+    CHECK(!run_patch_ref("ref3m.php", "orig\n", diff, make_test_resolver(corpus), out, err));
+}
+
+/* The sed early-exit ";B q" is optional: a directive without it still parses. */
+static void test_ed_reference_without_q_resolves() {
+    std::unordered_map<std::string, std::vector<std::string>> corpus = {
+        {"src/x.php", {"A", "B", "C"}}};
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: refq.php\n"
+        "0a\n"
+        "!sed -n '1,3 p' src/x.php  # s:6\n"  /* "A\nB\nC\n" = 6 bytes, no ;q */
+        ".\n";
+    std::string out, err;
+    CHECK(run_patch_ref("refq.php", "orig\n", diff, make_test_resolver(corpus), out, err));
+    CHECK_EQ(out, std::string("A\nB\nC\norig\n"));
+}
+
+static void test_ed_reference_out_of_range_fails() {
+    std::unordered_map<std::string, std::vector<std::string>> corpus = {
+        {"src/x.php", {"A", "B"}}};
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: ref4.php\n"
+        "0a\n" +
+        ref_directive("src/x.php", 1, 5, "A\nB\n") + "\n"
+        ".\n";
+    std::string out, err;
+    CHECK(!run_patch_ref("ref4.php", "orig\n", diff, make_test_resolver(corpus), out, err));
+}
+
+static void test_ed_reference_without_resolver_fails() {
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: ref5.php\n"
+        "0a\n" +
+        ref_directive("src/x.php", 1, 2, "A\nB\n") + "\n"
+        ".\n";
+    std::string out, err;
+    /* A patch with a reference but no resolver must fail, not silently drop it. */
+    CHECK(!run_patch_ref("ref5.php", "orig\n", diff, {}, out, err));
+}
+
+/* A line that merely starts with "!sed" but is not a complete directive must be
+ * kept as a literal line (no resolver needed). */
+static void test_ed_reference_literal_passthrough() {
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: ref6.php\n"
+        "0a\n"
+        "!sed is not a directive here\n"
+        ".\n";
+    std::string out, err;
+    CHECK(run_patch_ref("ref6.php", "orig\n", diff, {}, out, err));
+    CHECK_EQ(out, std::string("!sed is not a directive here\norig\n"));
+}
+
+/* The parser must decode the directive into a typed EdRef with the right
+ * fields. */
+static void test_ed_reference_parsed_fields() {
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: ref7.php\n"
+        "0a\n" +
+        ref_directive("a/b/c.php", 12, 34, "x\n") + "\n"
+        ".\n";
+    PatchSet ps;
+    std::string err;
+    CHECK(ps.parse(diff, g_tmpdir, err));
+    const FilePatch *fp = ps.find(PatchSet::canonicalize("ref7.php", g_tmpdir));
+    CHECK(fp != nullptr);
+    if (fp && fp->is_ed() && fp->ed().size() == 1 && fp->ed()[0].input.size() == 1) {
+        const phpatcher::EdPiece &piece = fp->ed()[0].input[0];
+        CHECK(std::holds_alternative<phpatcher::EdRef>(piece));
+        if (std::holds_alternative<phpatcher::EdRef>(piece)) {
+            const phpatcher::EdRef &ref = std::get<phpatcher::EdRef>(piece);
+            CHECK_EQ(ref.path, std::string("a/b/c.php"));
+            CHECK_EQ(ref.begin, static_cast<std::int64_t>(12));
+            CHECK_EQ(ref.end, static_cast<std::int64_t>(34));
+            /* ref_directive emits a length (s:) guard, no hash. */
+            CHECK_EQ(ref.bytes, static_cast<std::int64_t>(2));  /* "x\n" */
+            CHECK(!ref.has_hash);
+        }
+    } else {
+        CHECK(false);
+    }
+}
+
 static void test_duplicate_section_fails() {
     /* Two sections targeting the same file must be rejected at parse time. */
     PatchSet ps;
@@ -841,6 +1064,17 @@ int main() {
     test_basename_of();
     test_duplicate_section_fails();
     test_basename_index();
+
+    test_ed_reference_resolves();
+    test_ed_reference_mixed_with_literal();
+    test_ed_reference_length_mismatch_fails();
+    test_ed_reference_hash_resolves();
+    test_ed_reference_hash_mismatch_fails();
+    test_ed_reference_without_q_resolves();
+    test_ed_reference_out_of_range_fails();
+    test_ed_reference_without_resolver_fails();
+    test_ed_reference_literal_passthrough();
+    test_ed_reference_parsed_fields();
 
     /* Best-effort cleanup. */
     std::string cmd = "rm -rf '" + g_tmpdir + "'";

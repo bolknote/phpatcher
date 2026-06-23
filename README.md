@@ -166,6 +166,8 @@ phpatcher auto-detects the patch file format:
      descending line order exactly as `diff -e` does.
    - Limitation: a replacement line consisting solely of `.` cannot be
      represented (an ed-script convention). PHP source effectively never has one.
+   - An `a/c/i` input line may be a **corpus reference** instead of literal text
+     (see below).
 
 To produce an ed-script bundle from work-in-progress, `tools/changes-to-patch.sh`
 converts the uncommitted changes of a git repository into one (it diffs each
@@ -176,6 +178,52 @@ modified file's `HEAD` version against the working tree with `diff -e`):
 tools/changes-to-patch.sh -o changes.patch
 # then point phpatcher at it (base_dir = repo root) and revert the working tree
 ```
+
+### Corpus references (de-duplicating moved code)
+
+Refactoring that **moves** a block of code from one file to another would
+otherwise quote that block twice: once implicitly (deleted from the source) and
+once verbatim (re-added at the destination). To avoid re-emitting code that
+already exists in the tree, an `a/c/i` input line may be a reference:
+
+```
+!sed -n 'A,B p;B q' path/to/original.php  # s:<byte-length>
+```
+
+It instructs phpatcher to insert lines `A..B` (inclusive, 1-based) of
+`path/to/original.php` (resolved against `phpatcher.base_dir`) at that point. The
+line is human-readable and the `!sed …` command actually reproduces the
+referenced text in a shell (the `;B q` makes it quit after line `B` instead of
+scanning the rest of the file). phpatcher never runs sed — it slices the file
+directly — so the `;B q` is optional and ignored on the apply side.
+
+The trailing token is a **drift guard**, verified against the file on disk; if it
+does not match, the patch for that file **fails** (subject to
+`phpatcher.on_error`) instead of silently inserting the wrong code. The patch
+carries exactly one guard, and phpatcher checks whichever is present:
+
+- `s:<n>` — the exact byte length of the referenced run. The cheap default: the
+  common path does no hashing at all.
+- `h:<32-hex>` — a 128-bit content hash. Stronger (catches a same-length change),
+  opt-in for the paranoid.
+
+Because the references read the **pre-patch** source, the referenced files must
+match the code deployed on the target — exactly the sources phpatcher reads to
+apply the patch. A line that merely starts with `!sed` but is not a complete,
+guarded directive is treated as ordinary literal text.
+
+Generate references automatically with `-c`:
+
+```bash
+make -C tools                     # build phpatcher-index and phpatcher-match
+tools/changes-to-patch.sh -c -o changes.patch        # s: (length) guard
+tools/changes-to-patch.sh -c -H -o changes.patch     # h: (hash) guard
+```
+
+In corpus mode the script checks out the base revision, indexes it, and replaces
+runs of moved/duplicated lines (default: 3+ consecutive lines) with references.
+See `-n/--min-run`, `-x/--exclude`, `-H/--hash`, `--index`, and `--corpus-root`
+in `tools/changes-to-patch.sh --help`.
 
 ## OPcache & JIT
 
@@ -357,6 +405,10 @@ phpatcher.cpp              PHP glue: INI, lifecycle, the zend_compile_file hook.
 php_phpatcher.h            Module header.
 config.m4                  Build configuration (C++17).
 tools/changes-to-patch.sh  Turn uncommitted git changes into an ed-script bundle.
+tools/indexer.cpp          phpatcher-index: corpus line index for de-duplication.
+tools/matcher.cpp          phpatcher-match: factorize a block into corpus refs.
+tools/matcher_core.hpp     Reusable factorization algorithm (unit-tested).
+tools/Makefile             Build the helper tools (`make -C tools`).
 tests/*.phpt               PHP integration tests (run via `make test`).
 tests/fixtures/            Fixtures for the integration tests.
 tests/unit/                Standalone C++ unit tests for the core.

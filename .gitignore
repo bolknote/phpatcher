@@ -53,7 +53,13 @@ tests/*.mem
 # Unit test binaries
 tests/unit/test_patch
 tests/unit/test_patch_san
+tests/unit/test_matcher
 tests/unit/*.dSYM/
+
+# Compiled corpus tools and their output
+tools/phpatcher-index
+tools/phpatcher-match
+*.idx
 
 # Examples
 example/
