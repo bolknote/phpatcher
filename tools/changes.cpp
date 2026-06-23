@@ -64,7 +64,7 @@ void usage(const char *argv0) {
         "      --index <file>   corpus index from phpatcher-index (required with -c)\n"
         "      --corpus-root <d> root used to resolve indexed corpus files\n"
         "  -n, --min-run <n>    minimum run length for corpus refs (default: 3)\n"
-        "  -H, --hash           hash-guard byte-exact refs (normalized refs always h:)\n"
+        "  -H, --hash           guard refs with h: instead of s: (s: is default)\n"
         "      --php PATH       php interpreter for normalized indexes (default: php)\n"
         "      --normalizer PATH path to normalize.php (default: next to this binary)\n"
         "  -h, --help           show this help\n\n"

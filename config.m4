@@ -1,7 +1,7 @@
 PHP_ARG_ENABLE([phpatcher],
   [whether to enable phpatcher support],
   [AS_HELP_STRING([--enable-phpatcher],
-    [Enable phpatcher: in-memory unified-diff patching of PHP sources])],
+    [Enable phpatcher: in-memory phpatcher-ed patching of PHP sources])],
   [no])
 
 if test "$PHP_PHPATCHER" != "no"; then

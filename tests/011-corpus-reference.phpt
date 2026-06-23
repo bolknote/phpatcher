@@ -1,5 +1,5 @@
 --TEST--
-phpatcher: ed-script corpus reference (!sed) is resolved and length-verified
+phpatcher: phpatcher-ed corpus reference (r) is resolved and length-verified
 --SKIPIF--
 <?php if (!extension_loaded('phpatcher')) die('skip phpatcher not available'); ?>
 --INI--

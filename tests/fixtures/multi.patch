@@ -1,14 +1,9 @@
-diff --git a/fixtures/multi_a.php b/fixtures/multi_a.php
---- a/fixtures/multi_a.php
-+++ b/fixtures/multi_a.php
-@@ -1,2 +1,2 @@
- <?php
--function multi_a() { return "A1"; }
-+function multi_a() { return "A2"; }
-diff --git a/fixtures/multi_b.php b/fixtures/multi_b.php
---- a/fixtures/multi_b.php
-+++ b/fixtures/multi_b.php
-@@ -1,2 +1,2 @@
- <?php
--function multi_b() { return "B1"; }
-+function multi_b() { return "B2"; }
+# phpatcher-ed v1
+# file: fixtures/multi_a.php
+2c
+function multi_a() { return "A2"; }
+.
+# file: fixtures/multi_b.php
+2c
+function multi_b() { return "B2"; }
+.

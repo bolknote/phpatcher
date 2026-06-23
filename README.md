@@ -1,6 +1,6 @@
 # phpatcher
 
-A PHP extension that transparently applies a **unified diff (git patch)** to PHP
+A PHP extension that transparently applies a **phpatcher-ed patch** to PHP
 source files **in memory**, right before they are compiled — without ever
 modifying the files on disk.
 
@@ -35,7 +35,7 @@ that the engine calls for every file it compiles. OPcache, Xdebug, Blackfire and
 many other extensions hook it. phpatcher does the same:
 
 1. At module startup (`MINIT`) it reads the configured patch file, parses every
-   file diff and indexes them by canonical absolute path (a hash map for O(1)
+   file section and indexes it by canonical absolute path (a hash map for O(1)
    lookup).
 2. It installs its `zend_compile_file` hook at the head of the chain (always
    calling the previous handler, e.g. OPcache, afterwards).
@@ -82,10 +82,10 @@ Load it and point it at a patch file in your `php.ini` (or via `-d` flags):
 ```ini
 extension=phpatcher.so
 
-; Path to the unified-diff / git patch file.
+; Path to the phpatcher-ed patch file.
 phpatcher.patch_file=/path/to/changes.patch
 
-; Base directory the patch's a/ b/ paths are resolved against
+; Base directory the patch's relative file paths are resolved against
 ; (usually your project / repository root). Defaults to the CWD.
 phpatcher.base_dir=/path/to/project
 
@@ -117,8 +117,8 @@ All settings are `PHP_INI_SYSTEM` (read once at startup, set them in `php.ini`).
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `phpatcher.patch_file` | `""` | Path to the unified-diff file to apply. |
-| `phpatcher.base_dir` | CWD | Root used to resolve the patch's relative `a/`,`b/` paths to absolute files. |
+| `phpatcher.patch_file` | `""` | Path to the phpatcher-ed patch file to apply. |
+| `phpatcher.base_dir` | CWD | Root used to resolve the patch's relative `# file:` paths to absolute files. |
 | `phpatcher.enabled` | `1` | Master switch. When `0`, no hook is installed. |
 | `phpatcher.strict` | `1` | When `1`, a patch that does not cleanly apply (or whose file cannot be read) emits an `E_WARNING`. |
 | `phpatcher.on_error` | `original` | What to compile when a patch does not apply. `original` (default) compiles the unmodified file — *fail-open*: convenient, but a patch meant to close a vulnerability silently leaves the original code running. `fail` compiles a stub that throws a `RuntimeException` — *fail-closed*: the unpatched code never runs. Use `fail` for security hotfixes. Either way the on-disk file is never modified, and failures are counted in `phpatcher_stats()`. |
@@ -131,45 +131,38 @@ To minimise resident memory at the cost of CPU on cold compiles, set both
 fly every time the engine compiles it, and only the resulting opcodes are cached
 (by OPcache, in shared memory).
 
-## Patch formats
+## Patch Format
 
-phpatcher auto-detects the patch file format:
+phpatcher supports one patch format: **phpatcher-ed**, an ed-like,
+source-hiding bundle that describes changes purely by line numbers and
+replacement text, so it **never quotes the original/removed lines**. The format
+adds per-file headers and phpatcher-specific input directives such as `r`:
 
-1. **Unified diff** (`git diff` / `diff -u`) — the default. Easy to read, but it
-   embeds the original source: both context lines and the removed (`-`) lines.
+```
+# phpatcher-ed v1
+# file: src/Foo.php
+12c
+$new = 'replacement';
+.
+20,21d
+# file: src/Bar.php
+3a
+inserted line
+.
+```
 
-2. **phpatcher-ed bundle** — an ed-like, source-hiding format that describes
-   changes purely by line numbers and replacement text, so it **never quotes the
-   original/removed lines**. Use this when the patch must not leak the source it
-   modifies. The format adds per-file headers and phpatcher-specific input
-   directives such as `r`, so it is not a raw `diff -e` file:
-
-   ```
-   # phpatcher-ed v1
-   # file: src/Foo.php
-   12c
-   $new = 'replacement';
-   .
-   20,21d
-   # file: src/Bar.php
-   3a
-   inserted line
-   .
-   ```
-
-   - The bundle is selected automatically when the file begins with the
-     `# phpatcher-ed` magic line.
-   - `# file: <path>` starts each file section (path resolved against
-     `phpatcher.base_dir`).
-   - Supported edit commands: `Na` (append after line N), `Ni` (insert before N),
-     `M,Nc` / `Nc` (change), `M,Nd` / `Nd` (delete). Each `a/c/i` input block
-     ends with a lone `.` line. Commands are applied in order, so generators emit
-     them in descending line order to avoid line-number shifts.
-   - Limitation: a replacement line consisting solely of `.` cannot be
-     represented (inherited from the ed-style input-block terminator). PHP source
-     effectively never has one.
-   - An `a/c/i` input line may be a **corpus reference** instead of literal text
-     (see below).
+- The file must begin with the `# phpatcher-ed` magic line.
+- `# file: <path>` starts each file section (path resolved against
+  `phpatcher.base_dir`).
+- Supported edit commands: `Na` (append after line N), `Ni` (insert before N),
+  `M,Nc` / `Nc` (change), `M,Nd` / `Nd` (delete). Each `a/c/i` input block ends
+  with a lone `.` line. Commands are applied in order, so generators emit them in
+  descending line order to avoid line-number shifts.
+- Limitation: a replacement line consisting solely of `.` cannot be represented
+  (inherited from the ed-style input-block terminator). PHP source effectively
+  never has one.
+- An `a/c/i` input line may be a **corpus reference** instead of literal text
+  (see below).
 
 To produce a phpatcher-ed bundle from git changes, use the libgit2-based
 `tools/phpatcher-changes`. It compares a base revision to either another
@@ -183,8 +176,7 @@ tools/phpatcher-changes -b HEAD -o changes.patch      # base -> working tree
 # then point phpatcher at it (base_dir = repo root) and revert the working tree
 ```
 
-The older `tools/changes-to-patch.sh` remains as a compatibility wrapper; new
-generation work should prefer `phpatcher-changes`.
+The older `tools/changes-to-patch.sh` is a wrapper around `phpatcher-changes`.
 
 ### Corpus references (de-duplicating moved code)
 
@@ -199,14 +191,7 @@ r "path/to/original.php" A B  # s:<byte-length>
 
 It instructs phpatcher to insert lines `A..B` (inclusive, 1-based) of
 `path/to/original.php` (resolved against `phpatcher.base_dir`) at that point.
-The older shell-runnable form
-
-```
-!sed -n 'A,B p;B q' path/to/original.php  # s:<byte-length>
-```
-
-is still accepted for backwards compatibility, but new tools emit the native
-`r` form. A native reference may also carry a byte transform:
+A reference may also carry a byte transform:
 
 ```
 r "path/to/original.php" A B "left-pad" "right-pad"  # h:<hash>
@@ -228,8 +213,8 @@ carries exactly one guard, and phpatcher checks whichever is present:
 
 Because the references read the **pre-patch** source, the referenced files must
 match the code deployed on the target — exactly the sources phpatcher reads to
-apply the patch. A line that merely starts with `r` or `!sed` but is not a
-complete, guarded directive is treated as ordinary literal text.
+apply the patch. A line that merely starts with `r` but is not a complete,
+guarded directive is treated as ordinary literal text.
 
 Generate references automatically with `-c`:
 
@@ -258,8 +243,8 @@ header and uses the same default guard policy as byte-exact indexes: `s:` unless
 multi-line tokens stay byte-safe. Normalized references are emitted only when the
 `r` transform (or exact copy) reproduces the destination bytes;
 semantically-matched but differently formatted lines that cannot be represented
-are left literal. The shell `tools/changes-to-patch.sh` remains as a
-compatibility wrapper, but the libgit2 tool is the fast path.
+are left literal. The shell `tools/changes-to-patch.sh` delegates to the
+libgit2 tool.
 
 ## OPcache & JIT
 
@@ -423,19 +408,18 @@ active state, indexed file count and the precomputed file count and byte size.
 - The patch index covers files that exist on disk. Patches that create brand new
   files (`--- /dev/null`) are not served, since such a file cannot be `include`d
   from disk in the first place.
-- Patch application is strict (no fuzz): the hunk context must match the original
-  file exactly, just like `git apply` without fuzzing. A cosmetic change to the
-  source (whitespace, line endings) is enough to make a hunk stop applying.
+- Patch application is strict (no fuzz): line-addressed edits and corpus
+  reference guards must match the deployed source exactly.
 - Files using `__halt_compiler()` are never patched (their data offset cannot be
   preserved); they compile untouched.
 - The code that runs is the patched buffer, not the bytes on disk, so reported
   line numbers (errors, stack traces, debuggers) refer to the patched source.
-  Keep hunks line-count-neutral where you can to limit the drift.
+  Keep edits line-count-neutral where you can to limit the drift.
 
 ## Project layout
 
 ```
-patch.hpp / patch.cpp      Pure C++ core: unified-diff parser, applier, index.
+patch.hpp / patch.cpp      Pure C++ core: phpatcher-ed parser, applier, index.
                            No PHP dependency — independently unit-testable.
 phpatcher.cpp              PHP glue: INI, lifecycle, the zend_compile_file hook.
 php_phpatcher.h            Module header.

@@ -1,5 +1,5 @@
 /*
- * phpatcher - in-memory unified-diff patching core.
+ * phpatcher - in-memory phpatcher-ed patching core.
  *
  * This translation unit is intentionally free of any PHP/Zend dependency so
  * that it can be unit-tested in isolation and reused outside of the extension.
@@ -11,37 +11,9 @@
 #include <functional>
 #include <string>
 #include <string_view>
-#include <utility>
-#include <variant>
 #include <vector>
 
 namespace phpatcher {
-
-/* Role of a single unified-diff body line. Keeping the marker as a typed enum
- * (rather than the leading byte of the text) means apply() never re-parses a
- * character and an empty line is just an empty `text`, not a sentinel space. */
-enum class LineKind : std::uint8_t {
-    Context,    /* ' ' line, present unchanged on both sides           */
-    Remove,     /* '-' line, removed from the original                 */
-    Add,        /* '+' line, added in the patched file                 */
-    NoNewline   /* '\' "No newline at end of file" annotation          */
-};
-
-/* One body line of a unified-diff hunk: its role plus its content (without the
- * leading marker; empty for a NoNewline annotation). */
-struct DiffLine {
-    LineKind kind = LineKind::Context;
-    std::string text;
-};
-
-/* A single contiguous change region within a unified diff. */
-struct Hunk {
-    std::int64_t orig_start = 0;  /* 1-based first line of the hunk in the original */
-    std::int64_t orig_count = 0;  /* number of original lines covered by the hunk   */
-    std::int64_t new_start = 0;   /* 1-based first line of the hunk in the patched   */
-    std::int64_t new_count = 0;   /* number of patched lines produced by the hunk   */
-    std::vector<DiffLine> lines;  /* the hunk body, marker-decoded                  */
-};
 
 /* A 128-bit content hash (two independent FNV-1a-style lanes). Shared verbatim
  * by the corpus-reference generator (tools/) and the apply path so both compute
@@ -149,25 +121,12 @@ struct EdCommand {
 };
 
 /*
- * All edits targeting one concrete file. A file patch is expressed either as
- * unified-diff hunks or as a phpatcher-ed command list, never both: the variant
- * makes the illegal "both / neither" states unrepresentable. A
- * default-constructed FilePatch is an (empty) unified-diff patch.
+ * All edits targeting one concrete file. phpatcher intentionally supports only
+ * its source-hiding phpatcher-ed format, so a file patch is simply a list of
+ * line-addressed commands.
  */
 struct FilePatch {
-    std::variant<std::vector<Hunk>, std::vector<EdCommand>> body{std::in_place_index<0>};
-
-    [[nodiscard]] bool is_ed() const {
-        return body.index() == 1;
-    }
-
-    [[nodiscard]] std::vector<Hunk>& hunks() { return std::get<0>(body); }
-    [[nodiscard]] const std::vector<Hunk>& hunks() const { return std::get<0>(body); }
-    [[nodiscard]] std::vector<EdCommand>& ed() { return std::get<1>(body); }
-    [[nodiscard]] const std::vector<EdCommand>& ed() const { return std::get<1>(body); }
-
-    /* Switch this patch to the ed-script representation (empty). */
-    void make_ed() { body.emplace<1>(); }
+    std::vector<EdCommand> commands;
 };
 
 /*
@@ -182,12 +141,10 @@ public:
     using Entry = std::pair<std::string, FilePatch>;  /* (canonical path, edits) */
 
     /*
-     * Parse a patch file (unified diff or ed-script bundle; auto-detected).
-     * `base_dir` resolves the diff's relative a/ b/ paths into absolute,
-     * canonical filesystem paths. Replaces any previously parsed content.
+     * Parse a phpatcher-ed patch file. `base_dir` resolves `# file:` paths into
+     * absolute, canonical filesystem paths. Replaces any previously parsed content.
      * Returns false and fills `error` on a hard parse error (including a file
-     * targeted by more than one section); an empty or hunk-less patch is a
-     * successful no-op.
+     * targeted by more than one section); an empty patch is a successful no-op.
      */
     bool parse(const std::string& diff_text, const std::string& base_dir, std::string& error);
 
@@ -224,7 +181,7 @@ public:
      * Apply `fp` to `original`, producing `out`. Returns false and fills
      * `error` if the patch does not cleanly apply (context/removal mismatch,
      * out-of-range or overlapping edits). apply() itself never touches the
-     * filesystem; an ed patch that contains corpus references needs a `resolve`
+     * filesystem; a patch that contains corpus references needs a `resolve`
      * callback to expand them, and without one such a reference is an error.
      */
     [[nodiscard]] static bool apply(const FilePatch& fp, const std::string& original,

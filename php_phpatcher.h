@@ -1,5 +1,5 @@
 /*
- * phpatcher - transparently apply a unified diff to PHP source files in memory
+ * phpatcher - transparently apply phpatcher-ed patches to PHP source files in memory
  * at compile time, without ever modifying the files on disk.
  */
 #ifndef PHP_PHPATCHER_H

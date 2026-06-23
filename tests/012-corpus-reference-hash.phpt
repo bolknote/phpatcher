@@ -1,5 +1,5 @@
 --TEST--
-phpatcher: ed-script corpus reference (!sed) with hash (h:) guard is resolved
+phpatcher: phpatcher-ed corpus reference (r) with hash (h:) guard is resolved
 --SKIPIF--
 <?php if (!extension_loaded('phpatcher')) die('skip phpatcher not available'); ?>
 --INI--

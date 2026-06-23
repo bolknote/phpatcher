@@ -1,5 +1,5 @@
 # phpatcher-ed v1
 # file: fixtures/ref_src.php
 2a
-!sed -n '2,5 p;5 q' fixtures/ref_donor.php  # s:61
+r "fixtures/ref_donor.php" 2 5 # s:61
 .

@@ -1,5 +1,5 @@
 /*
- * phpatcher - in-memory unified-diff / ed-script patching core.
+ * phpatcher - in-memory phpatcher-ed patching core.
  *
  * Deliberately free of any PHP/Zend dependency so it can be unit-tested in
  * isolation. The two entry points are PatchSet::parse() (build an index from a
@@ -22,7 +22,6 @@
 #include <fstream>
 #include <sstream>
 #include <string_view>
-#include <variant>
 
 namespace phpatcher {
 namespace {
@@ -32,13 +31,9 @@ namespace fs = std::filesystem;
 using std::string_view;
 constexpr std::size_t npos = string_view::npos;
 
-/* Tokens recognised in the two supported patch formats. */
+/* Tokens recognised in the phpatcher-ed format. */
 constexpr string_view kEdMagic = "# phpatcher-ed";  /* phpatcher-ed selector    */
 constexpr string_view kEdFileHeader = "# file:";    /* per-file section marker  */
-constexpr string_view kOldFileHeader = "--- ";      /* unified-diff old path    */
-constexpr string_view kNewFileHeader = "+++ ";      /* unified-diff new path    */
-constexpr string_view kHunkHeader = "@@";           /* unified-diff hunk header */
-constexpr string_view kDevNull = "/dev/null";       /* "no such file" sentinel  */
 constexpr char kEdInputTerminator = '.';            /* ends an a/c/i input block*/
 
 bool is_digit(char c) { return c >= '0' && c <= '9'; }
@@ -115,55 +110,7 @@ bool read_uint(string_view s, std::size_t& pos, std::int64_t& out) {
     return true;
 }
 
-/* Strip a unified-diff path field of its trailing tab-separated timestamp
- * (git/diff sometimes append "\t<date>") and its a// b/ prefix. */
-std::string clean_diff_path(string_view raw) {
-    const std::size_t tab = raw.find('\t');
-    if (tab != npos) {
-        raw = raw.substr(0, tab);
-    }
-    while (!raw.empty() && (raw.back() == '\r' || raw.back() == ' ')) {
-        raw.remove_suffix(1);
-    }
-    if (raw == kDevNull) {
-        return std::string(raw);
-    }
-    if (raw.size() >= 2 && (raw[0] == 'a' || raw[0] == 'b') && raw[1] == '/') {
-        raw.remove_prefix(2);
-    }
-    return std::string(raw);
-}
-
-/* Parse "@@ -l[,s] +l[,s] @@". Omitted counts default to 1. */
-bool parse_hunk_header(string_view line, Hunk& hunk) {
-    if (line.substr(0, kHunkHeader.size()) != kHunkHeader) {
-        return false;
-    }
-    const std::size_t minus = line.find('-');
-    const std::size_t plus = line.find('+');
-    if (minus == npos || plus == npos || plus < minus) {
-        return false;
-    }
-
-    /* A range is "<sign>start[,count]"; `marker` points at the sign. */
-    auto read_range = [&](std::size_t marker, std::int64_t& start, std::int64_t& count) -> bool {
-        std::size_t pos = marker + 1;
-        if (!read_uint(line, pos, start)) {
-            return false;
-        }
-        if (pos < line.size() && line[pos] == ',') {
-            ++pos;
-            return read_uint(line, pos, count);
-        }
-        count = 1;
-        return true;
-    };
-
-    return read_range(minus, hunk.orig_start, hunk.orig_count) &&
-           read_range(plus, hunk.new_start, hunk.new_count);
-}
-
-/* True if the patch text is one of our ed-script bundles (its first non-blank
+/* True if the patch text is one of our phpatcher-ed bundles (its first non-blank
  * line starts with the magic token). */
 bool looks_like_ed_bundle(string_view text) {
     for (std::size_t i = 0; i <= text.size();) {
@@ -330,78 +277,23 @@ bool parse_r_directive(string_view line, EdRef& ref) {
     return parse_guard_tokens(line.substr(pos + 2), ref);
 }
 
-/* Parse one phpatcher-ed input-block line into a piece. A line is treated as a corpus
- * reference only if it fully matches either the legacy shell-friendly form
- *
- *     !sed -n 'A,B p[;B q]' PATH  # <guard>
- *
- * or the native phpatcher form
+/* Parse one phpatcher-ed input-block line into a piece. A line is treated as a
+ * corpus reference only if it fully matches the native phpatcher form
  *
  *     r "PATH" A B ["lpad" "rpad"] # <guard>
  *
- * The optional ";B q" (sed early-exit) is accepted but ignored — phpatcher
- * slices the file itself and never runs sed. <guard> is space-separated
- * key:value tokens, at least one of which must be "s:<len>" (byte length) or
- * "h:<32 hex>" (content hash). Anything that deviates (including ordinary code
- * that merely starts with "!sed") is kept verbatim as a literal line. */
+ * <guard> is space-separated key:value tokens, at least one of which must be
+ * "s:<len>" (byte length) or "h:<32 hex>" (content hash). Anything that
+ * deviates (including ordinary code that merely starts with "r ") is kept
+ * verbatim as a literal line. */
 EdPiece parse_ed_input_piece(string_view line) {
-    constexpr string_view kRefPrefix = "!sed -n '";
-    constexpr string_view kMetaIntro = "# ";
-
     const auto literal = [&]() { return EdPiece(std::string(line)); };
 
     EdRef native_ref;
     if (parse_r_directive(line, native_ref)) {
         return EdPiece(std::move(native_ref));
     }
-
-    if (line.substr(0, kRefPrefix.size()) != kRefPrefix) return literal();
-    std::size_t pos = kRefPrefix.size();
-
-    std::int64_t begin = 0, end = 0;
-    if (!read_uint(line, pos, begin)) return literal();
-    if (pos >= line.size() || line[pos] != ',') return literal();
-    ++pos;
-    if (!read_uint(line, pos, end)) return literal();
-
-    /* The sed script up to the closing quote: " p" with an optional ";<n> q". */
-    const std::size_t quote = line.find('\'', pos);
-    if (quote == npos) return literal();
-    {
-        string_view body = line.substr(pos, quote - pos);
-        if (body.substr(0, 2) != " p") return literal();
-        body.remove_prefix(2);
-        if (!body.empty()) {
-            if (body.front() != ';') return literal();
-            body.remove_prefix(1);
-            std::size_t d = 0;
-            while (d < body.size() && body[d] >= '0' && body[d] <= '9') ++d;
-            if (d == 0) return literal();
-            body.remove_prefix(d);
-            if (body != " q") return literal();
-        }
-    }
-    pos = quote + 1;
-    if (pos >= line.size() || line[pos] != ' ') return literal();
-    ++pos;
-
-    const string_view rest = line.substr(pos);
-    const std::size_t marker = rest.rfind(kMetaIntro);
-    if (marker == npos) return literal();
-
-    string_view path = rest.substr(0, marker);
-    while (!path.empty() && path.back() == ' ') path.remove_suffix(1);
-    if (path.empty() || begin < 1 || end < begin) return literal();
-
-    EdRef ref;
-    ref.path = std::string(path);
-    ref.begin = begin;
-    ref.end = end;
-
-    string_view meta = rest.substr(marker + kMetaIntro.size());
-    if (!parse_guard_tokens(meta, ref)) return literal();
-
-    return EdPiece(std::move(ref));
+    return literal();
 }
 
 /* Expand an ed input block into concrete line views. Literal pieces reference
@@ -457,7 +349,7 @@ bool apply_ed_script(const FilePatch& fp, string_view original, std::string& out
         return false;
     };
 
-    for (const EdCommand& c : fp.ed()) {
+    for (const EdCommand& c : fp.commands) {
         const auto size = static_cast<std::int64_t>(lines.size());
         switch (c.kind) {
             case EdCommand::Delete:
@@ -612,125 +504,14 @@ bool PatchSet::parse(const std::string& diff_text, const std::string& base_dir, 
     index_.clear();
     basenames_.clear();
 
-    if (looks_like_ed_bundle(diff_text)) {
-        return parse_ed_bundle(diff_text, base_dir, error);
-    }
-
-    bool ends_nl = false;
-    const std::vector<string_view> lines = split_lines(diff_text, ends_nl);
-
-    FilePatch current;
-    std::string current_key;   /* canonical path of `current`, the index key  */
-    bool have_current = false;
-    std::string pending_old;   /* path from the last "--- " line */
-    std::string pending_new;   /* path from the last "+++ " line */
-    Hunk* active_hunk = nullptr;
-    std::int64_t need_orig = 0; /* original-side body lines still expected by active_hunk */
-    std::int64_t need_new = 0;  /* new-side body lines still expected by active_hunk      */
-
-    const auto flush_current = [&]() {
-        if (have_current && !current.hunks().empty()) {
-            index_.emplace_back(std::move(current_key), std::move(current));
-        }
-        current = FilePatch();
-        current_key.clear();
-        have_current = false;
-        active_hunk = nullptr;
-    };
-
-    const auto begin_file = [&]() -> bool {
-        /* Target the patched (new) path when present, else the old path. */
-        string_view chosen;
-        if (!pending_new.empty() && pending_new != kDevNull) {
-            chosen = pending_new;
-        } else if (!pending_old.empty() && pending_old != kDevNull) {
-            chosen = pending_old;
-        } else {
-            error = "diff hunk without a usable target file path";
-            return false;
-        }
-        flush_current();
-        current_key = canonicalize(std::string(chosen), base_dir);
-        have_current = true;
+    if (diff_text.empty()) {
         return true;
-    };
-
-    for (std::size_t i = 0; i < lines.size(); ++i) {
-        const string_view line = lines[i];
-
-        /* While a hunk still expects body lines, consume them verbatim. This is
-         * essential for correctness: a removed/added line whose *content* begins
-         * with "--- ", "+++ " or "@@" must not be mistaken for a header. The
-         * line counts in the hunk header tell us exactly where the body ends. */
-        if (active_hunk != nullptr && (need_orig > 0 || need_new > 0)) {
-            const char marker = line.empty() ? ' ' : line[0];
-            /* Body content is the line without its marker byte (empty for an
-             * empty context line, which a diff may emit as a wholly blank line). */
-            const string_view content = line.size() <= 1 ? string_view() : line.substr(1);
-            switch (marker) {
-                case ' ':  /* context line (an empty line is empty context) */
-                    active_hunk->lines.push_back({LineKind::Context, std::string(content)});
-                    --need_orig;
-                    --need_new;
-                    break;
-                case '-':  /* removed from the original */
-                    active_hunk->lines.push_back({LineKind::Remove, std::string(content)});
-                    --need_orig;
-                    break;
-                case '+':  /* added in the patched file */
-                    active_hunk->lines.push_back({LineKind::Add, std::string(content)});
-                    --need_new;
-                    break;
-                case '\\':  /* "\ No newline" note; consumes no original/new line */
-                    active_hunk->lines.push_back({LineKind::NoNewline, std::string()});
-                    break;
-                default:
-                    /* Fewer body lines than declared: end the hunk and revisit
-                     * this line as a header or metadata. */
-                    active_hunk = nullptr;
-                    --i;
-                    break;
-            }
-            continue;
-        }
-
-        /* A trailing "\ No newline at end of file" note belongs to the hunk we
-         * have just finished consuming. */
-        if (active_hunk != nullptr && !line.empty() && line[0] == '\\') {
-            active_hunk->lines.push_back({LineKind::NoNewline, std::string()});
-            continue;
-        }
-        active_hunk = nullptr;  /* the active hunk (if any) is now complete */
-
-        if (line.substr(0, kOldFileHeader.size()) == kOldFileHeader) {
-            pending_old = clean_diff_path(line.substr(kOldFileHeader.size()));
-            pending_new.clear();
-        } else if (line.substr(0, kNewFileHeader.size()) == kNewFileHeader) {
-            pending_new = clean_diff_path(line.substr(kNewFileHeader.size()));
-            if (!begin_file()) {
-                return false;
-            }
-        } else if (line.substr(0, kHunkHeader.size()) == kHunkHeader) {
-            if (!have_current) {
-                error = "hunk header encountered before any file header";
-                return false;
-            }
-            Hunk hunk;
-            if (!parse_hunk_header(line, hunk)) {
-                error = "malformed hunk header: " + std::string(line);
-                return false;
-            }
-            current.hunks().push_back(std::move(hunk));
-            active_hunk = &current.hunks().back();
-            need_orig = active_hunk->orig_count;
-            need_new = active_hunk->new_count;
-        }
-        /* Anything else outside a hunk is git metadata (diff --git, index,
-         * mode, rename/copy, binary markers, ...) and is ignored. */
     }
-
-    flush_current();
-    return finalize(error);  /* also rejects a file targeted by two sections */
+    if (!looks_like_ed_bundle(diff_text)) {
+        error = "unsupported patch format: expected '# phpatcher-ed'";
+        return false;
+    }
+    return parse_ed_bundle(diff_text, base_dir, error);
 }
 
 bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& base_dir,
@@ -739,7 +520,6 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
     const std::vector<string_view> lines = split_lines(diff_text, ends_nl);
 
     FilePatch current;
-    current.make_ed();
     std::string current_key;  /* canonical path of `current`, the index key */
     bool have_current = false;
 
@@ -747,11 +527,10 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
     bool in_input = false;
 
     const auto flush_current = [&]() {
-        if (have_current && !current.ed().empty()) {
+        if (have_current && !current.commands.empty()) {
             index_.emplace_back(std::move(current_key), std::move(current));
         }
         current = FilePatch();
-        current.make_ed();
         current_key.clear();
         have_current = false;
     };
@@ -760,7 +539,7 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
         /* Inside an a/c/i text block: collect lines until a lone "." */
         if (in_input) {
             if (line.size() == 1 && line[0] == kEdInputTerminator) {
-                current.ed().push_back(std::move(pending));
+                current.commands.push_back(std::move(pending));
                 pending = EdCommand();
                 in_input = false;
             } else {
@@ -808,7 +587,7 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
             pending = std::move(cmd);
             in_input = true;
         } else {
-            current.ed().push_back(std::move(cmd));
+            current.commands.push_back(std::move(cmd));
         }
     }
 
@@ -839,83 +618,7 @@ bool PatchSet::has_basename(std::string_view basename) const {
 
 bool PatchSet::apply(const FilePatch& fp, const std::string& original,
                      std::string& out, std::string& error, const RefResolver& resolve) {
-    if (fp.is_ed()) {
-        return apply_ed_script(fp, original, out, error, resolve);
-    }
-
-    bool orig_ends_nl = false;
-    const std::vector<string_view> src = split_lines(original, orig_ends_nl);
-
-    std::vector<string_view> result;
-    result.reserve(src.size() + 16);
-
-    std::size_t cursor = 0;        /* 0-based read position in `src`            */
-    bool consumed_to_eof = false;  /* did the last hunk reach the end of `src`? */
-    bool new_eof_no_nl = false;    /* should the rebuilt EOF omit its newline?  */
-
-    for (const Hunk& hunk : fp.hunks()) {
-        /* Where this hunk starts in the original (0-based). A pure insertion
-         * (orig_count == 0) starts after `orig_start` lines. */
-        const std::int64_t raw_start = (hunk.orig_count == 0) ? hunk.orig_start : hunk.orig_start - 1;
-        const auto start_index = static_cast<std::size_t>(raw_start < 0 ? 0 : raw_start);
-
-        if (start_index < cursor) {
-            error = "overlapping or out-of-order hunks";
-            return false;
-        }
-        if (start_index > src.size()) {
-            error = "hunk starts beyond end of original file";
-            return false;
-        }
-
-        for (; cursor < start_index; ++cursor) {  /* copy lines before the hunk */
-            result.push_back(src[cursor]);
-        }
-
-        LineKind prev_kind = LineKind::Context;
-        for (const DiffLine& dl : hunk.lines) {
-            const string_view text(dl.text);
-            switch (dl.kind) {
-                case LineKind::Context:
-                    if (cursor >= src.size() || src[cursor] != text) {
-                        error = "context mismatch at original line " + std::to_string(cursor + 1);
-                        return false;
-                    }
-                    result.push_back(src[cursor++]);
-                    new_eof_no_nl = false;
-                    break;
-                case LineKind::Remove:
-                    if (cursor >= src.size() || src[cursor] != text) {
-                        error = "removal mismatch at original line " + std::to_string(cursor + 1);
-                        return false;
-                    }
-                    ++cursor;
-                    break;
-                case LineKind::Add:
-                    result.push_back(text);
-                    new_eof_no_nl = false;
-                    break;
-                case LineKind::NoNewline:
-                    /* The note refers to the side of the immediately preceding line. */
-                    if (prev_kind == LineKind::Add || prev_kind == LineKind::Context) {
-                        new_eof_no_nl = true;
-                    }
-                    break;
-            }
-            prev_kind = dl.kind;
-        }
-
-        consumed_to_eof = (cursor >= src.size());
-    }
-
-    for (; cursor < src.size(); ++cursor) {  /* copy lines after the last hunk */
-        result.push_back(src[cursor]);
-        consumed_to_eof = false;
-    }
-
-    const bool trailing_newline = consumed_to_eof ? !new_eof_no_nl : orig_ends_nl;
-    join_lines(result, trailing_newline, out);
-    return true;
+    return apply_ed_script(fp, original, out, error, resolve);
 }
 
 }  // namespace phpatcher

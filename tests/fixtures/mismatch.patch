@@ -1,7 +1,5 @@
-diff --git a/fixtures/mismatch_src.php b/fixtures/mismatch_src.php
---- a/fixtures/mismatch_src.php
-+++ b/fixtures/mismatch_src.php
-@@ -1,2 +1,2 @@
- <?php
--function mismatch_value() { return 999; }
-+function mismatch_value() { return 2; }
+# phpatcher-ed v1
+# file: fixtures/mismatch_src.php
+99c
+function mismatch_value() { return 2; }
+.
