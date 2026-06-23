@@ -36,14 +36,18 @@
  * Build:  c++ -std=c++17 -O2 -o tools/phpatcher-index tools/indexer.cpp
  */
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -52,7 +56,6 @@
 
 namespace fs = std::filesystem;
 
-using phpatcher::tools::NormLine;
 using phpatcher::tools::Normalizer;
 
 namespace {
@@ -71,6 +74,7 @@ struct Options {
     bool dump = false;
     bool verbose = false;
     bool normalize = false;        /* tokenize via php coprocess */
+    std::size_t jobs = 0;          /* normalizer workers; 0 = auto (CPU count) */
     std::string php = "php";       /* php interpreter for normalization */
     std::string normalizer;        /* path to normalize.php (default: next to argv0) */
 };
@@ -90,6 +94,7 @@ void usage(const char *argv0) {
         "  -o, --output FILE     write the binary index to FILE\n"
         "      --dump            print the index as text to stdout\n"
         "  -n, --normalize       tokenize via php and collapse inter-token whitespace\n"
+        "  -j, --jobs N          parallel normalizer workers (default: auto = CPU count)\n"
         "      --php PATH         php interpreter for --normalize (default: php)\n"
         "      --normalizer PATH  path to normalize.php (default: next to this binary)\n"
         "  -v, --verbose         report stats and the most common lines to stderr\n"
@@ -240,6 +245,144 @@ bool write_index(const Index &idx, const Options &opt, std::size_t &keys_written
     return static_cast<bool>(f);
 }
 
+/* A matched source file awaiting normalization. Its index in the collected list
+ * is its scan-order file id, so postings are numbered deterministically
+ * regardless of which worker happens to process it. */
+struct NormFile {
+    std::string abs;  /* absolute path, read by the worker          */
+    std::string rel;  /* path relative to root, stored in the index */
+};
+
+/* Per-worker partial index plus line counters, merged after the threads join. */
+struct WorkerResult {
+    std::unordered_map<std::string, std::vector<std::uint64_t>> lines;
+    std::size_t total = 0, nonempty = 0, indexed = 0;
+};
+
+/* Portable default worker count: std::thread::hardware_concurrency() is the
+ * standard, OS-agnostic way (Windows/macOS/Linux); it returns 0 when it cannot
+ * tell, in which case we fall back to a single worker. */
+std::size_t auto_jobs() {
+    const unsigned hc = std::thread::hardware_concurrency();
+    return hc ? static_cast<std::size_t>(hc) : 1u;
+}
+
+/* Pull files off the shared cursor and normalize each via this worker's own
+ * coprocess, accumulating anchors into a private map (no shared state, so no
+ * locking on the hot path). */
+void normalize_worker(Normalizer &nz, const std::vector<NormFile> &files,
+                      std::atomic<std::size_t> &cursor, std::size_t min_len,
+                      WorkerResult &out) {
+    for (;;) {
+        const std::size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
+        if (i >= files.size()) break;
+
+        std::string content;
+        if (!read_file(files[i].abs, content)) {
+            std::fprintf(stderr, "  skip (unreadable): %s\n", files[i].abs.c_str());
+            continue;
+        }
+        const std::uint32_t fid = static_cast<std::uint32_t>(i);
+        nz.run_each(content, [&](std::uint32_t li, std::uint8_t, std::string_view key) {
+            ++out.total;
+            if (key.empty()) return;
+            ++out.nonempty;
+            if (trim(key).size() < min_len) return;
+            out.lines[std::string(key)].push_back(
+                pack(fid, static_cast<std::uint32_t>(li + 1)));
+            ++out.indexed;
+        });
+    }
+}
+
+/* Normalize `files` across N worker coprocesses and fold the results into `idx`.
+ * Returns the worker count actually used. The output is content-equivalent to a
+ * serial build: file ids are compacted to the files that contribute, in scan
+ * order, and every posting list is sorted, so it does not depend on thread
+ * timing. */
+std::size_t process_normalized_parallel(const std::vector<NormFile> &files,
+                                        const Options &opt, Index &idx,
+                                        std::size_t &total_lines,
+                                        std::size_t &nonempty_lines,
+                                        std::size_t &indexed_lines) {
+    const std::size_t nfiles = files.size();
+    if (nfiles == 0) return 0;
+
+    std::size_t jobs = opt.jobs ? opt.jobs : auto_jobs();
+    if (jobs < 1) jobs = 1;
+    if (jobs > nfiles) jobs = nfiles;
+
+    /* Spawn the coprocesses while still single-threaded: fork() in a process that
+     * already has worker threads running is unsafe, so do it first. */
+    std::vector<std::unique_ptr<Normalizer>> nz;
+    nz.reserve(jobs);
+    for (std::size_t j = 0; j < jobs; ++j) {
+        auto n = std::make_unique<Normalizer>();
+        n->start(opt.php, opt.normalizer);
+        nz.push_back(std::move(n));
+    }
+
+    std::vector<WorkerResult> results(jobs);
+    std::atomic<std::size_t> cursor{0};
+    if (jobs == 1) {
+        normalize_worker(*nz[0], files, cursor, opt.min_len, results[0]);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(jobs);
+        for (std::size_t j = 0; j < jobs; ++j) {
+            threads.emplace_back(normalize_worker, std::ref(*nz[j]), std::cref(files),
+                                 std::ref(cursor), opt.min_len, std::ref(results[j]));
+        }
+        for (std::thread &t : threads) t.join();
+    }
+    nz.clear();  /* dtor closes pipes (EOF) and reaps each coprocess */
+
+    /* Merge: adopt the first worker's map, fold the rest in by moving posting
+     * lists (a key is copied only when it is new to the merged map). */
+    std::unordered_map<std::string, std::vector<std::uint64_t>> merged;
+    for (std::size_t j = 0; j < jobs; ++j) {
+        total_lines += results[j].total;
+        nonempty_lines += results[j].nonempty;
+        indexed_lines += results[j].indexed;
+        if (merged.empty()) {
+            merged = std::move(results[j].lines);
+            continue;
+        }
+        for (auto &kv : results[j].lines) {
+            std::vector<std::uint64_t> &dst = merged[kv.first];
+            if (dst.empty()) {
+                dst = std::move(kv.second);
+            } else {
+                dst.insert(dst.end(), std::make_move_iterator(kv.second.begin()),
+                           std::make_move_iterator(kv.second.end()));
+            }
+        }
+    }
+
+    /* Compact file ids down to the files that actually contributed, keeping scan
+     * order, then sort each posting list so the result is independent of which
+     * worker saw which file (matches the serial build's content). */
+    std::vector<char> used(nfiles, 0);
+    for (const auto &kv : merged)
+        for (std::uint64_t p : kv.second) used[posting_file(p)] = 1;
+
+    std::vector<std::uint32_t> remap(nfiles, 0);
+    idx.files.clear();
+    for (std::size_t id = 0; id < nfiles; ++id) {
+        if (used[id]) {
+            remap[id] = static_cast<std::uint32_t>(idx.files.size());
+            idx.files.push_back(files[id].rel);
+        }
+    }
+    for (auto &kv : merged) {
+        for (std::uint64_t &p : kv.second)
+            p = pack(remap[posting_file(p)], posting_line(p));
+        std::sort(kv.second.begin(), kv.second.end());
+    }
+    idx.lines = std::move(merged);
+    return jobs;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -263,6 +406,7 @@ int main(int argc, char **argv) {
         else if (a == "-o" || a == "--output") opt.output = next(a.c_str());
         else if (a == "--dump") opt.dump = true;
         else if (a == "-n" || a == "--normalize") opt.normalize = true;
+        else if (a == "-j" || a == "--jobs") opt.jobs = parse_uint(a, next(a.c_str()));
         else if (a == "--php") opt.php = next(a.c_str());
         else if (a == "--normalizer") opt.normalizer = next(a.c_str());
         else if (a == "-v" || a == "--verbose") opt.verbose = true;
@@ -277,7 +421,6 @@ int main(int argc, char **argv) {
 
     const std::unordered_set<std::string> exts(opt.exts.begin(), opt.exts.end());
 
-    Normalizer normalizer;
     if (opt.normalize) {
         if (opt.normalizer.empty()) {
             fs::path self(argv[0]);
@@ -288,10 +431,10 @@ int main(int argc, char **argv) {
         if (!fs::exists(opt.normalizer))
             die("normalizer script not found: " + opt.normalizer +
                 " (pass --normalizer PATH)");
-        normalizer.start(opt.php, opt.normalizer);
     }
 
     Index idx;
+    std::vector<NormFile> norm_files;  /* matched files awaiting normalization */
     std::size_t scanned_files = 0, matched_files = 0, excluded_dirs = 0;
     std::size_t total_lines = 0, nonempty_lines = 0, indexed_lines = 0;
 
@@ -316,6 +459,16 @@ int main(int argc, char **argv) {
         if (!exts.count(ext_of(entry.path()))) continue;
         ++matched_files;
 
+        /* Normalized indexing is deferred: record the file now and process the
+         * whole list in parallel after the (serial) directory walk, so both the
+         * php tokenization and the per-file disk reads spread across cores. */
+        if (opt.normalize) {
+            norm_files.push_back(NormFile{
+                entry.path().string(),
+                fs::relative(entry.path(), root, ec2).string()});
+            continue;
+        }
+
         std::string content;
         if (!read_file(entry.path(), content)) {
             std::fprintf(stderr, "  skip (unreadable): %s\n", entry.path().c_str());
@@ -333,30 +486,6 @@ int main(int argc, char **argv) {
             }
             return file_id;
         };
-
-        if (opt.normalize) {
-            /* The coprocess streams one key per physical line, in order, so the
-             * 0-based index + 1 is the 1-based line number on disk. Keys arrive as
-             * views into the normalizer's buffer (no per-line allocation); we copy
-             * a std::string only for the lines we actually index. Indivisible
-             * lines (flag 1, e.g. heredoc bodies) are indexed verbatim and skip
-             * the min-len filter only implicitly — their key is the raw bytes.
-             * min-len is judged on the trimmed length so an indented indivisible
-             * PHPDoc marker (raw key, but few significant chars once trimmed) is
-             * filtered as the garbage anchor it is; normalized keys carry no
-             * surrounding whitespace, so trim() is a no-op for them. */
-            normalizer.run_each(content, [&](std::uint32_t i, std::uint8_t,
-                                             std::string_view key) {
-                ++total_lines;
-                if (key.empty()) return;
-                ++nonempty_lines;
-                if (trim(key).size() < opt.min_len) return;
-                idx.lines[std::string(key)].push_back(
-                    pack(ensure_id(), static_cast<std::uint32_t>(i + 1)));
-                ++indexed_lines;
-            });
-            continue;
-        }
 
         std::uint32_t lineno = 0;
         std::size_t start = 0;
@@ -378,6 +507,12 @@ int main(int argc, char **argv) {
         }
     }
     if (ec) die("directory scan failed: " + ec.message());
+
+    std::size_t norm_jobs = 0;
+    if (opt.normalize) {
+        norm_jobs = process_normalized_parallel(norm_files, opt, idx, total_lines,
+                                                nonempty_lines, indexed_lines);
+    }
 
     /* Frequency stats and cap accounting. */
     std::size_t distinct_keys = idx.lines.size();
@@ -426,6 +561,9 @@ int main(int argc, char **argv) {
         excluded_dirs, scanned_files, matched_files, total_lines, nonempty_lines,
         indexed_lines, opt.min_len, distinct_keys,
         capped_keys, capped_postings, opt.max_postings, secs);
+
+    if (opt.normalize)
+        std::fprintf(stderr, "  normalize jobs   %zu\n", norm_jobs);
 
     if (opt.dump) {
         for (const auto &kv : idx.lines) {

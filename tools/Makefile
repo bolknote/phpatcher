@@ -15,7 +15,7 @@ BINS := phpatcher-index phpatcher-match phpatcher-changes
 all: $(BINS)
 
 phpatcher-index: indexer.cpp normalizer.hpp
-	$(CXX) $(CXXFLAGS) -o $@ indexer.cpp
+	$(CXX) $(CXXFLAGS) -pthread -o $@ indexer.cpp
 
 phpatcher-match: matcher.cpp matcher_core.hpp normalizer.hpp ../patch.hpp
 	$(CXX) $(CXXFLAGS) -o $@ matcher.cpp

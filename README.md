@@ -232,7 +232,7 @@ make -C tools                     # build all helper tools (phpatcher-changes re
 # Build (or reuse) the corpus checkout and index:
 git archive "$BASE" | tar -x -C corpus
 tools/phpatcher-index -o corpus.idx corpus
-tools/phpatcher-index --normalize -o corpus_norm.idx corpus
+tools/phpatcher-index --normalize -o corpus_norm.idx corpus   # -j N to cap workers
 
 # Fast libgit2 generator, base revision -> HEAD:
 tools/phpatcher-changes -b "$BASE" --to HEAD -c \
@@ -242,6 +242,14 @@ tools/phpatcher-changes -b "$BASE" --to HEAD -c \
 tools/phpatcher-changes -b "$BASE" --to HEAD -c -H \
   --corpus-root corpus --index corpus_norm.idx -o changes_norm_hash.patch
 ```
+
+Normalized indexing tokenizes each file through a `php` coprocess, so it runs
+several workers in parallel: `phpatcher-index --normalize` spawns one coprocess
+per CPU by default (detected portably via `std::thread::hardware_concurrency()`
+on Windows/macOS/Linux) and `-j N` / `--jobs N` caps that. The output is
+content-identical regardless of the worker count — file ids are compacted in
+scan order and every posting list is sorted — so a parallel build matches a
+serial one anchor-for-anchor.
 
 In corpus mode `phpatcher-changes` loads the index once and runs the matcher
 in-process for every input block. A normalized index is detected from the index
