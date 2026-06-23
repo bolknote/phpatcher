@@ -33,7 +33,7 @@ using std::string_view;
 constexpr std::size_t npos = string_view::npos;
 
 /* Tokens recognised in the two supported patch formats. */
-constexpr string_view kEdMagic = "# phpatcher-ed";  /* ed-bundle selector       */
+constexpr string_view kEdMagic = "# phpatcher-ed";  /* phpatcher-ed selector    */
 constexpr string_view kEdFileHeader = "# file:";    /* per-file section marker  */
 constexpr string_view kOldFileHeader = "--- ";      /* unified-diff old path    */
 constexpr string_view kNewFileHeader = "+++ ";      /* unified-diff new path    */
@@ -330,7 +330,7 @@ bool parse_r_directive(string_view line, EdRef& ref) {
     return parse_guard_tokens(line.substr(pos + 2), ref);
 }
 
-/* Parse one ed input-block line into a piece. A line is treated as a corpus
+/* Parse one phpatcher-ed input-block line into a piece. A line is treated as a corpus
  * reference only if it fully matches either the legacy shell-friendly form
  *
  *     !sed -n 'A,B p[;B q]' PATH  # <guard>
@@ -440,7 +440,7 @@ bool build_input(const std::vector<EdPiece>& input, const PatchSet::RefResolver&
     return true;
 }
 
-/* Apply an ed-script FilePatch to `original`. Corpus references are expanded via
+/* Apply a phpatcher-ed FilePatch to `original`. Corpus references are expanded via
  * `resolve`; an ed script without references does not need one. */
 bool apply_ed_script(const FilePatch& fp, string_view original, std::string& out,
                      std::string& error, const PatchSet::RefResolver& resolve) {

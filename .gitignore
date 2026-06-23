@@ -59,6 +59,7 @@ tests/unit/*.dSYM/
 # Compiled corpus tools and their output
 tools/phpatcher-index
 tools/phpatcher-match
+tools/phpatcher-changes
 *.idx
 
 # Examples

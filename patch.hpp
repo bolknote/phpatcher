@@ -122,17 +122,17 @@ struct EdRef {
     std::string rpad;        /* used by TrimPad                                  */
 };
 
-/* One element of an ed input block: either a literal line or a corpus reference
- * that expands to one or more lines. */
+/* One element of a phpatcher-ed input block: either a literal line or a corpus
+ * reference that expands to one or more lines. */
 using EdPiece = std::variant<std::string, EdRef>;
 
 /*
- * A single ed-script editing command (the kind produced by `diff -e`).
+ * A single phpatcher-ed editing command.
  *
- * ed scripts describe a change purely by line numbers and replacement text;
- * they never quote the original/removed lines. `diff -e` also emits commands in
- * descending line order so they can be applied sequentially without the line
- * numbers shifting.
+ * phpatcher-ed borrows the small line-addressed command set from ed (`a`, `c`,
+ * `d`, `i`) but extends input blocks with typed pieces such as corpus
+ * references. Generators emit commands in descending line order so they can be
+ * applied sequentially without line numbers shifting.
  */
 struct EdCommand {
     enum Kind {
@@ -150,9 +150,9 @@ struct EdCommand {
 
 /*
  * All edits targeting one concrete file. A file patch is expressed either as
- * unified-diff hunks or as an ed script, never both: the variant makes the
- * illegal "both / neither" states unrepresentable. A default-constructed
- * FilePatch is an (empty) unified-diff patch.
+ * unified-diff hunks or as a phpatcher-ed command list, never both: the variant
+ * makes the illegal "both / neither" states unrepresentable. A
+ * default-constructed FilePatch is an (empty) unified-diff patch.
  */
 struct FilePatch {
     std::variant<std::vector<Hunk>, std::vector<EdCommand>> body{std::in_place_index<0>};
@@ -249,7 +249,7 @@ public:
     void recanonicalize(const std::function<std::string(const std::string&)>& fn);
 
 private:
-    /* Parse our ed-script bundle format (see README). Selected automatically by
+    /* Parse our phpatcher-ed bundle format (see README). Selected automatically by
      * parse() when the input begins with the "# phpatcher-ed" magic line. */
     bool parse_ed_bundle(const std::string& diff_text, const std::string& base_dir,
                          std::string& error);

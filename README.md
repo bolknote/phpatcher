@@ -59,6 +59,7 @@ in the patch pay only a single hash lookup — no `realpath()`, no I/O.
   stable across the 8.x series. CI runs the suite on 8.2, 8.3 and 8.4.
 - A C++17 compiler (clang or gcc).
 - `phpize` / `php-config` (the PHP development headers).
+- `libgit2` + `pkg-config` for the helper tools (`phpatcher-changes`).
 
 ## Build & install
 
@@ -137,11 +138,11 @@ phpatcher auto-detects the patch file format:
 1. **Unified diff** (`git diff` / `diff -u`) — the default. Easy to read, but it
    embeds the original source: both context lines and the removed (`-`) lines.
 
-2. **ed-script bundle** (`diff -e`) — describes changes purely by line numbers
-   and the new text, so it **never quotes the original/removed lines**. Use this
-   when the patch must not leak the source it modifies. The format is a thin
-   wrapper that adds per-file headers (a plain `diff -e` has neither a filename
-   nor multi-file support):
+2. **phpatcher-ed bundle** — an ed-like, source-hiding format that describes
+   changes purely by line numbers and replacement text, so it **never quotes the
+   original/removed lines**. Use this when the patch must not leak the source it
+   modifies. The format adds per-file headers and phpatcher-specific input
+   directives such as `r`, so it is not a raw `diff -e` file:
 
    ```
    # phpatcher-ed v1
@@ -160,24 +161,30 @@ phpatcher auto-detects the patch file format:
      `# phpatcher-ed` magic line.
    - `# file: <path>` starts each file section (path resolved against
      `phpatcher.base_dir`).
-   - Supported ed commands: `Na` (append after line N), `Ni` (insert before N),
+   - Supported edit commands: `Na` (append after line N), `Ni` (insert before N),
      `M,Nc` / `Nc` (change), `M,Nd` / `Nd` (delete). Each `a/c/i` input block
-     ends with a lone `.` line. Commands are applied in order, so emit them in
-     descending line order exactly as `diff -e` does.
+     ends with a lone `.` line. Commands are applied in order, so generators emit
+     them in descending line order to avoid line-number shifts.
    - Limitation: a replacement line consisting solely of `.` cannot be
-     represented (an ed-script convention). PHP source effectively never has one.
+     represented (inherited from the ed-style input-block terminator). PHP source
+     effectively never has one.
    - An `a/c/i` input line may be a **corpus reference** instead of literal text
      (see below).
 
-To produce an ed-script bundle from work-in-progress, `tools/changes-to-patch.sh`
-converts the uncommitted changes of a git repository into one (it diffs each
-modified file's `HEAD` version against the working tree with `diff -e`):
+To produce a phpatcher-ed bundle from git changes, use the libgit2-based
+`tools/phpatcher-changes`. It compares a base revision to either another
+revision (`--to`, useful for benchmarking or release-to-release patches) or the
+working tree, and emits only edit commands plus added text:
 
 ```bash
-# inside your repo, with uncommitted edits in the working tree:
-tools/changes-to-patch.sh -o changes.patch
+# inside your repo:
+tools/phpatcher-changes -b HEAD~3 --to HEAD -o changes.patch
+tools/phpatcher-changes -b HEAD -o changes.patch      # base -> working tree
 # then point phpatcher at it (base_dir = repo root) and revert the working tree
 ```
+
+The older `tools/changes-to-patch.sh` remains as a compatibility wrapper; new
+generation work should prefer `phpatcher-changes`.
 
 ### Corpus references (de-duplicating moved code)
 
@@ -217,7 +224,7 @@ carries exactly one guard, and phpatcher checks whichever is present:
 - `s:<n>` — the exact byte length of the referenced run. The cheap default: the
   common path does no hashing at all.
 - `h:<32-hex>` — a 128-bit content hash. Stronger (catches a same-length change),
-  opt-in for byte-exact references and mandatory for token-normalized references.
+  emitted only when the generator is run with `-H` / `--hash`.
 
 Because the references read the **pre-patch** source, the referenced files must
 match the code deployed on the target — exactly the sources phpatcher reads to
@@ -227,22 +234,32 @@ complete, guarded directive is treated as ordinary literal text.
 Generate references automatically with `-c`:
 
 ```bash
-make -C tools                     # build phpatcher-index and phpatcher-match
-tools/changes-to-patch.sh -c -o changes.patch        # s: (length) guard
-tools/changes-to-patch.sh -c -H -o changes.patch     # h: (hash) guard
-tools/changes-to-patch.sh -c --normalize -o changes.patch  # token-normalized, h:
+make -C tools                     # build helper tools (requires libgit2)
+
+# Build (or reuse) the corpus checkout and index:
+git archive "$BASE" | tar -x -C corpus
+tools/phpatcher-index -o corpus.idx corpus
+tools/phpatcher-index --normalize -o corpus_norm.idx corpus
+
+# Fast libgit2 generator, base revision -> HEAD:
+tools/phpatcher-changes -b "$BASE" --to HEAD -c \
+  --corpus-root corpus --index corpus.idx -o changes.patch
+tools/phpatcher-changes -b "$BASE" --to HEAD -c \
+  --corpus-root corpus --index corpus_norm.idx -o changes_norm.patch
+tools/phpatcher-changes -b "$BASE" --to HEAD -c -H \
+  --corpus-root corpus --index corpus_norm.idx -o changes_norm_hash.patch
 ```
 
-In corpus mode the script checks out the base revision, indexes it, and replaces
-runs of moved/duplicated lines (default: 3+ consecutive lines) with references.
-With `--normalize`, the indexer and matcher use PHP's tokenizer to collapse
-inter-token whitespace (`while(true)` and `while ( true )` match), while strings,
-heredocs/nowdocs and multi-line tokens stay byte-safe. Normalized references are
-hash-guarded and emitted only when the `r` transform (or exact copy) reproduces
-the destination bytes; semantically-matched but differently formatted lines that
-cannot be represented are left literal. See `-n/--min-run`, `-x/--exclude`,
-`-H/--hash`, `--normalize`, `--index`, and `--corpus-root` in
-`tools/changes-to-patch.sh --help`.
+In corpus mode `phpatcher-changes` loads the index once and runs the matcher
+in-process for every input block. A normalized index is detected from the index
+header and uses the same default guard policy as byte-exact indexes: `s:` unless
+`-H` / `--hash` is passed. The tokenizer path collapses inter-token whitespace
+(`while(true)` and `while ( true )` match), while strings, heredocs/nowdocs and
+multi-line tokens stay byte-safe. Normalized references are emitted only when the
+`r` transform (or exact copy) reproduces the destination bytes;
+semantically-matched but differently formatted lines that cannot be represented
+are left literal. The shell `tools/changes-to-patch.sh` remains as a
+compatibility wrapper, but the libgit2 tool is the fast path.
 
 ## OPcache & JIT
 
@@ -424,6 +441,7 @@ phpatcher.cpp              PHP glue: INI, lifecycle, the zend_compile_file hook.
 php_phpatcher.h            Module header.
 config.m4                  Build configuration (C++17).
 tools/changes-to-patch.sh  Turn uncommitted git changes into an ed-script bundle.
+tools/changes.cpp          phpatcher-changes: fast libgit2 ed-bundle generator.
 tools/indexer.cpp          phpatcher-index: corpus line index for de-duplication.
 tools/matcher.cpp          phpatcher-match: factorize a block into corpus refs.
 tools/matcher_core.hpp     Reusable factorization algorithm (unit-tested).

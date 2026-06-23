@@ -390,9 +390,6 @@ int main(int argc, char **argv) {
 
     Index idx;
     idx.load(opt.index);
-    if (idx.normalized()) {
-        opt.hash = true;  /* normalized references must guard raw bytes, not just length */
-    }
 
     Normalizer normalizer;
     if (idx.normalized()) {
