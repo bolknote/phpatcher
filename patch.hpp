@@ -11,6 +11,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace phpatcher {
@@ -28,7 +29,8 @@ struct RefHash {
 inline RefHash ref_hash(std::string_view s) {
     std::uint64_t h1 = 14695981039346656037ull;
     std::uint64_t h2 = 1469598103934665603ull;
-    for (unsigned char c : s) {
+    for (char ch : s) {
+        const auto c = static_cast<unsigned char>(ch);
         h1 = (h1 ^ c) * 1099511628211ull;
         h2 = (h2 ^ c) * 0x9E3779B97F4A7C15ull;
     }
@@ -42,9 +44,12 @@ inline RefHash ref_hash(std::string_view s) {
 inline std::string ref_hash_hex(RefHash h) {
     static const char digits[] = "0123456789abcdef";
     std::string out(32, '0');
-    for (int i = 0; i < 16; ++i) {
-        out[15 - i] = digits[(h.a >> (i * 4)) & 0xf];
-        out[31 - i] = digits[(h.b >> (i * 4)) & 0xf];
+    for (std::size_t i = 0; i < 16; ++i) {
+        const auto shift = static_cast<unsigned int>(i * 4);
+        const auto a = static_cast<std::size_t>((h.a >> shift) & 0xfu);
+        const auto b = static_cast<std::size_t>((h.b >> shift) & 0xfu);
+        out[15u - i] = digits[a];
+        out[31u - i] = digits[b];
     }
     return out;
 }
