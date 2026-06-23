@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -94,9 +95,17 @@ public:
 
     bool started() const { return pid_ > 0; }
 
-    /* Normalize one file's content into per-physical-line keys (index i -> the
-     * 1-based physical line i+1). */
-    std::vector<NormLine> run(std::string_view content) {
+    /* Normalize one file's content, invoking `on_line(index, flag, key)` for each
+     * physical line in order (index is 0-based; the 1-based disk line is index+1).
+     *
+     * `key` is a std::string_view that is only valid for the duration of the
+     * callback: it usually points straight into the internal read buffer (no
+     * per-line allocation), and into reusable scratch storage when a key happens
+     * to straddle a buffer refill. Callers that need to keep a key must copy it.
+     * This zero-copy path lets the hot indexer allocate a std::string only for the
+     * lines it actually indexes, instead of one per physical line. */
+    template <typename Fn>
+    void run_each(std::string_view content, Fn &&on_line) {
         std::string req;
         put_u32le(req, static_cast<std::uint32_t>(content.size()));
         req.append(content.data(), content.size());
@@ -107,18 +116,25 @@ public:
         if (!read_all(hdr, 4)) normalizer_fatal("normalizer read failed (coprocess died?)");
         const std::uint32_t nlines = get_u32le(hdr);
 
-        std::vector<NormLine> out;
-        out.reserve(nlines);
         for (std::uint32_t i = 0; i < nlines; ++i) {
             unsigned char meta[5];
             if (!read_all(meta, 5)) normalizer_fatal("normalizer truncated response");
-            NormLine nl;
-            nl.flag = meta[0];
+            const std::uint8_t flag = meta[0];
             const std::uint32_t klen = get_u32le(meta + 1);
-            nl.key.resize(klen);
-            if (klen && !read_all(&nl.key[0], klen)) normalizer_fatal("normalizer truncated key");
-            out.push_back(std::move(nl));
+            std::string_view key;
+            if (!read_view(klen, key)) normalizer_fatal("normalizer truncated key");
+            on_line(i, flag, key);
         }
+    }
+
+    /* Normalize one file's content into an owning per-physical-line vector (index
+     * i -> the 1-based physical line i+1). Convenience wrapper over run_each() for
+     * callers that keep the keys around (e.g. the matcher's corpus cache). */
+    std::vector<NormLine> run(std::string_view content) {
+        std::vector<NormLine> out;
+        run_each(content, [&](std::uint32_t, std::uint8_t flag, std::string_view key) {
+            out.push_back(NormLine{flag, std::string(key)});
+        });
         return out;
     }
 
@@ -132,20 +148,59 @@ private:
         }
         return true;
     }
+
+    /* Pull one chunk from the pipe into the read buffer. A response is parsed in
+     * many tiny pieces (5-byte metas, short keys); reading them one syscall at a
+     * time means ~2 reads per physical line. Buffering collapses that to a read()
+     * per ~64 KiB. Safe because the protocol is half-duplex: the coprocess only
+     * produces the current file's response, so a bulk read never crosses into a
+     * future response (none exists until we send the next request). */
+    bool fill_buffer() {
+        if (rbuf_.empty()) rbuf_.resize(1u << 16);  /* 64 KiB */
+        for (;;) {
+            const ssize_t r = read(rd_, rbuf_.data(), rbuf_.size());
+            if (r < 0) { if (errno == EINTR) continue; return false; }
+            if (r == 0) return false;  /* EOF: coprocess gone */
+            rpos_ = 0;
+            rend_ = static_cast<std::size_t>(r);
+            return true;
+        }
+    }
     bool read_all(void *buf, std::size_t n) {
         auto *p = static_cast<char *>(buf);
         while (n > 0) {
-            const ssize_t r = read(rd_, p, n);
-            if (r < 0) { if (errno == EINTR) continue; return false; }
-            if (r == 0) return false;  /* EOF: coprocess gone */
-            p += r; n -= static_cast<std::size_t>(r);
+            if (rpos_ == rend_ && !fill_buffer()) return false;
+            const std::size_t avail = rend_ - rpos_;
+            const std::size_t take = avail < n ? avail : n;
+            std::memcpy(p, rbuf_.data() + rpos_, take);
+            rpos_ += take; p += take; n -= take;
         }
+        return true;
+    }
+
+    /* Hand back `n` upcoming bytes as a contiguous view. Zero-copy when they are
+     * already buffered (the common case); otherwise gather them into reusable
+     * scratch. The view is valid only until the next read on this Normalizer. */
+    bool read_view(std::size_t n, std::string_view &out) {
+        if (rpos_ == rend_ && n > 0 && !fill_buffer()) return false;
+        if (rend_ - rpos_ >= n) {  /* fully buffered: no copy */
+            out = std::string_view(rbuf_.data() + rpos_, n);
+            rpos_ += n;
+            return true;
+        }
+        scratch_.resize(n);  /* straddles a refill: assemble contiguously */
+        if (n && !read_all(scratch_.data(), n)) return false;
+        out = std::string_view(scratch_.data(), n);
         return true;
     }
 
     pid_t pid_ = -1;
     int wr_ = -1;
     int rd_ = -1;
+    std::vector<char> rbuf_;   /* read buffer for the response stream    */
+    std::size_t rpos_ = 0;     /* next unread byte in rbuf_              */
+    std::size_t rend_ = 0;     /* bytes currently valid in rbuf_         */
+    std::string scratch_;      /* reused gather buffer for split keys    */
 };
 
 }  // namespace tools

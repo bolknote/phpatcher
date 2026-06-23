@@ -51,30 +51,46 @@ function normalize(string $src): string {
         return pack('V', 0);
     }
 
-    $raw = explode("\n", $src);
-    if (str_ends_with($src, "\n")) {
-        array_pop($raw);
+    $nlines = substr_count($src, "\n");
+    if (!str_ends_with($src, "\n")) {
+        $nlines++;  /* trailing partial line with no newline */
     }
-    $nlines = count($raw);
 
     $keys = array_fill(0, $nlines, '');
-    $indiv = array_fill(0, $nlines, false);
+    $indiv = [];   /* sparse: only multi-line (indivisible) line indices are set */
 
     $tokens = token_get_all($src);
     $cur = 0;
 
     foreach ($tokens as $tok) {
-        [$id, $text] = is_array($tok) ? $tok : [-1, $tok];
+        if (is_array($tok)) {
+            $id = $tok[0];
+            $text = $tok[1];
+            if ($id === T_WHITESPACE) {
+                $cur += substr_count($text, "\n");
+                continue;
+            }
+        } else {
+            $text = $tok;
+        }
 
-        if ($id === T_WHITESPACE) {
-            $cur += substr_count($text, "\n");
+        /* Fast path: the token lives entirely on one line (the overwhelming
+         * majority — operators, identifiers, single-line strings/comments).
+         * Append it to the current line's key without splitting. */
+        if (strpos($text, "\n") === false) {
+            if ($cur < $nlines) {
+                if ($keys[$cur] !== '') {
+                    $keys[$cur] .= ' ';
+                }
+                $keys[$cur] .= $text;
+            }
             continue;
         }
 
-        /* Split into per-line segments. A token like "<?php\n" or "// x\n"
-         * carries a trailing newline but only has content on one line, so it
-         * is NOT multi-line; only tokens with content on 2+ lines (heredoc /
-         * nowdoc bodies, multi-line strings/comments) are "indivisible". */
+        /* Slow path: a token that spans newlines. A token like "<?php\n" or
+         * "// x\n" carries a trailing newline but only has content on one line,
+         * so it is NOT multi-line; only tokens with content on 2+ lines (heredoc
+         * / nowdoc bodies, multi-line strings/comments) are "indivisible". */
         $segs = explode("\n", $text);
         $nseg = count($segs);
 
@@ -109,14 +125,27 @@ function normalize(string $src): string {
         $cur += $nseg - 1;
     }
 
+    /* Common case: no indivisible lines, so we never need the raw line bytes and
+     * can emit straight from $keys — skipping the explode() of the whole file. */
+    if (!$indiv) {
+        $body = '';
+        foreach ($keys as $k) {
+            $body .= "\x00" . pack('V', strlen($k)) . $k;
+        }
+        return pack('V', $nlines) . $body;
+    }
+
+    /* Indivisible lines exist (heredoc/nowdoc/multi-line string or comment):
+     * their key is the raw line bytes (CR stripped), so materialize the lines. */
+    $raw = explode("\n", $src);
     $body = '';
     for ($i = 0; $i < $nlines; $i++) {
-        if (empty($indiv[$i])) {
-            $flag = "\x00";
-            $k = $keys[$i];
-        } else {
+        if (isset($indiv[$i])) {
             $flag = "\x01";
             $k = rtrim($raw[$i], "\r");
+        } else {
+            $flag = "\x00";
+            $k = $keys[$i];
         }
         $body .= $flag . pack('V', strlen($k)) . $k;
     }

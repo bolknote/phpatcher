@@ -335,27 +335,26 @@ int main(int argc, char **argv) {
         };
 
         if (opt.normalize) {
-            /* The coprocess returns one key per physical line, in order, so the
-             * vector index + 1 is the 1-based line number on disk. Indivisible
+            /* The coprocess streams one key per physical line, in order, so the
+             * 0-based index + 1 is the 1-based line number on disk. Keys arrive as
+             * views into the normalizer's buffer (no per-line allocation); we copy
+             * a std::string only for the lines we actually index. Indivisible
              * lines (flag 1, e.g. heredoc bodies) are indexed verbatim and skip
-             * the min-len filter; normal lines carry collapsed whitespace. */
-            const std::vector<NormLine> keys = normalizer.run(content);
-            for (std::size_t i = 0; i < keys.size(); ++i) {
+             * the min-len filter only implicitly — their key is the raw bytes.
+             * min-len is judged on the trimmed length so an indented indivisible
+             * PHPDoc marker (raw key, but few significant chars once trimmed) is
+             * filtered as the garbage anchor it is; normalized keys carry no
+             * surrounding whitespace, so trim() is a no-op for them. */
+            normalizer.run_each(content, [&](std::uint32_t i, std::uint8_t,
+                                             std::string_view key) {
                 ++total_lines;
-                const NormLine &nl = keys[i];
-                if (nl.key.empty()) continue;
+                if (key.empty()) return;
                 ++nonempty_lines;
-                /* min-len is judged on the trimmed length so an indented
-                 * indivisible PHPDoc marker (raw key, but only a couple of
-                 * significant chars once trimmed) is filtered as the garbage
-                 * anchor it is. Normalized keys carry no surrounding whitespace,
-                 * so trim() is a no-op for them; the stored key stays raw for
-                 * indivisible (flag==1) lines. */
-                if (trim(std::string_view(nl.key)).size() < opt.min_len) continue;
-                idx.lines[nl.key].push_back(
+                if (trim(key).size() < opt.min_len) return;
+                idx.lines[std::string(key)].push_back(
                     pack(ensure_id(), static_cast<std::uint32_t>(i + 1)));
                 ++indexed_lines;
-            }
+            });
             continue;
         }
 
