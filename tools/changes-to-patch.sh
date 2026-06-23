@@ -17,14 +17,15 @@
 #   tools/changes-to-patch.sh src/A.php src/B.php   # only these files
 #   tools/changes-to-patch.sh -b HEAD~3             # diff against another base
 #   tools/changes-to-patch.sh -c                    # de-duplicate moved code
+#   tools/changes-to-patch.sh -c --normalize        # token-normalized matching
 #
 # Corpus mode (-c/--corpus):
 #   Refactoring that moves a block of code between files would otherwise quote
 #   the block twice (deleted from the source, re-added at the destination). With
 #   -c the inserted text is factorized against the *base* revision of the tree:
-#   runs of lines that already exist verbatim are replaced by a reference
+#   runs of lines that already exist in the corpus are replaced by a reference
 #
-#       !sed -n 'A,B p' path/to/original.php  # h:<hash>
+#       r "path/to/original.php" A B  # h:<hash>
 #
 #   that phpatcher resolves (and hash-verifies) at apply time. This needs the
 #   compiled helper tools next to this script (phpatcher-index, phpatcher-match;
@@ -51,6 +52,7 @@ MIN_RUN="3"
 INDEX_FILE=""
 CORPUS_ROOT=""
 HASH=""
+NORMALIZE=""
 EXCLUDES=()
 
 usage() {
@@ -61,11 +63,14 @@ Usage:
   tools/changes-to-patch.sh src/A.php src/B.php   # only these files
   tools/changes-to-patch.sh -b HEAD~3             # diff against another base
   tools/changes-to-patch.sh -c                    # de-duplicate moved code
+  tools/changes-to-patch.sh -c --normalize        # token-normalized matching
 
 Options:
   -b, --base <rev>      base revision to diff against (default: HEAD)
   -o, --output <file>   write the bundle to <file> instead of stdout
   -c, --corpus          replace moved/duplicated code with corpus references
+      --normalize       build a PHP-token-normalized index (corpus mode; refs
+                        are hash-guarded)
   -n, --min-run <n>     min run length for a reference (corpus mode; default 3)
   -x, --exclude <dir>   directory name to skip when indexing (repeatable)
   -H, --hash            guard references with a content hash (h:) instead of the
@@ -84,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         -b|--base)    BASE="${2:?missing value for $1}"; shift 2 ;;
         -o|--output)  OUT="${2:?missing value for $1}"; shift 2 ;;
         -c|--corpus)  CORPUS=1; shift ;;
+        --normalize)  NORMALIZE=1; shift ;;
         -n|--min-run) MIN_RUN="${2:?missing value for $1}"; shift 2 ;;
         -x|--exclude) EXCLUDES+=("${2:?missing value for $1}"); shift 2 ;;
         -H|--hash)    HASH=1; shift ;;
@@ -152,6 +158,7 @@ if [[ -n "$CORPUS" ]]; then
         INDEX="$tmpdir/corpus.idx"
         xargs=()
         for d in "${EXCLUDES[@]:-}"; do [[ -n "$d" ]] && xargs+=("-x" "$d"); done
+        [[ -n "$NORMALIZE" ]] && xargs+=("--normalize")
         echo "Indexing base tree..." >&2
         "$indexer" "${xargs[@]}" -o "$INDEX" "$corpus_dir"
     fi

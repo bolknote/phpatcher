@@ -805,6 +805,21 @@ static std::string ref_directive_hash(const std::string &path, int a, int b,
            "  # h:" + phpatcher::ref_hash_hex(phpatcher::ref_hash(bytes));
 }
 
+static std::string r_directive_hash(const std::string &path, int a, int b,
+                                    const std::string &bytes) {
+    return "r \"" + path + "\" " + std::to_string(a) + " " + std::to_string(b) +
+           " # h:" + phpatcher::ref_hash_hex(phpatcher::ref_hash(bytes));
+}
+
+static std::string r_directive_trim_pad_hash(const std::string &path, int a, int b,
+                                             const std::string &lpad,
+                                             const std::string &rpad,
+                                             const std::string &bytes) {
+    return "r \"" + path + "\" " + std::to_string(a) + " " + std::to_string(b) +
+           " \"" + lpad + "\" \"" + rpad + "\" # h:" +
+           phpatcher::ref_hash_hex(phpatcher::ref_hash(bytes));
+}
+
 static bool run_patch_ref(const std::string &relpath, const std::string &original,
                           const std::string &diff, const phpatcher::PatchSet::RefResolver &resolve,
                           std::string &out, std::string &err) {
@@ -873,6 +888,35 @@ static void test_ed_reference_hash_resolves() {
     std::string out, err;
     CHECK(run_patch_ref("ref3h.php", "orig\n", diff, make_test_resolver(corpus), out, err));
     CHECK_EQ(out, std::string("A\nB\nC\norig\n"));
+}
+
+static void test_ed_native_r_reference_resolves() {
+    std::unordered_map<std::string, std::vector<std::string>> corpus = {
+        {"src/x.php", {"A", "B", "C"}}};
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: refr.php\n"
+        "0a\n" +
+        r_directive_hash("src/x.php", 1, 2, "A\nB\n") + "\n"
+        ".\n";
+    std::string out, err;
+    CHECK(run_patch_ref("refr.php", "orig\n", diff, make_test_resolver(corpus), out, err));
+    CHECK_EQ(out, std::string("A\nB\norig\n"));
+}
+
+static void test_ed_native_r_reference_trim_pad_resolves() {
+    std::unordered_map<std::string, std::vector<std::string>> corpus = {
+        {"src/x.php", {"    foo();   "}}};
+    const std::string diff =
+        "# phpatcher-ed v1\n"
+        "# file: refpad.php\n"
+        "0a\n" +
+        r_directive_trim_pad_hash("src/x.php", 1, 1, "\t", " // moved",
+                                  "    foo();   \n") + "\n"
+        ".\n";
+    std::string out, err;
+    CHECK(run_patch_ref("refpad.php", "orig\n", diff, make_test_resolver(corpus), out, err));
+    CHECK_EQ(out, std::string("\tfoo(); // moved\norig\n"));
 }
 
 static void test_ed_reference_hash_mismatch_fails() {
@@ -969,6 +1013,7 @@ static void test_ed_reference_parsed_fields() {
             /* ref_directive emits a length (s:) guard, no hash. */
             CHECK_EQ(ref.bytes, static_cast<std::int64_t>(2));  /* "x\n" */
             CHECK(!ref.has_hash);
+            CHECK_EQ(ref.transform, phpatcher::EdRef::Exact);
         }
     } else {
         CHECK(false);
@@ -1069,6 +1114,8 @@ int main() {
     test_ed_reference_mixed_with_literal();
     test_ed_reference_length_mismatch_fails();
     test_ed_reference_hash_resolves();
+    test_ed_native_r_reference_resolves();
+    test_ed_native_r_reference_trim_pad_resolves();
     test_ed_reference_hash_mismatch_fails();
     test_ed_reference_without_q_resolves();
     test_ed_reference_out_of_range_fails();

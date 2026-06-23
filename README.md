@@ -187,15 +187,27 @@ once verbatim (re-added at the destination). To avoid re-emitting code that
 already exists in the tree, an `a/c/i` input line may be a reference:
 
 ```
-!sed -n 'A,B p;B q' path/to/original.php  # s:<byte-length>
+r "path/to/original.php" A B  # s:<byte-length>
 ```
 
 It instructs phpatcher to insert lines `A..B` (inclusive, 1-based) of
-`path/to/original.php` (resolved against `phpatcher.base_dir`) at that point. The
-line is human-readable and the `!sed …` command actually reproduces the
-referenced text in a shell (the `;B q` makes it quit after line `B` instead of
-scanning the rest of the file). phpatcher never runs sed — it slices the file
-directly — so the `;B q` is optional and ignored on the apply side.
+`path/to/original.php` (resolved against `phpatcher.base_dir`) at that point.
+The older shell-runnable form
+
+```
+!sed -n 'A,B p;B q' path/to/original.php  # s:<byte-length>
+```
+
+is still accepted for backwards compatibility, but new tools emit the native
+`r` form. A native reference may also carry a byte transform:
+
+```
+r "path/to/original.php" A B "left-pad" "right-pad"  # h:<hash>
+```
+
+which inserts `left-pad + trim(line) + right-pad` for each resolved line. This is
+used only when it reproduces the destination bytes exactly; otherwise the
+generator leaves that line literal.
 
 The trailing token is a **drift guard**, verified against the file on disk; if it
 does not match, the patch for that file **fails** (subject to
@@ -205,12 +217,12 @@ carries exactly one guard, and phpatcher checks whichever is present:
 - `s:<n>` — the exact byte length of the referenced run. The cheap default: the
   common path does no hashing at all.
 - `h:<32-hex>` — a 128-bit content hash. Stronger (catches a same-length change),
-  opt-in for the paranoid.
+  opt-in for byte-exact references and mandatory for token-normalized references.
 
 Because the references read the **pre-patch** source, the referenced files must
 match the code deployed on the target — exactly the sources phpatcher reads to
-apply the patch. A line that merely starts with `!sed` but is not a complete,
-guarded directive is treated as ordinary literal text.
+apply the patch. A line that merely starts with `r` or `!sed` but is not a
+complete, guarded directive is treated as ordinary literal text.
 
 Generate references automatically with `-c`:
 
@@ -218,12 +230,19 @@ Generate references automatically with `-c`:
 make -C tools                     # build phpatcher-index and phpatcher-match
 tools/changes-to-patch.sh -c -o changes.patch        # s: (length) guard
 tools/changes-to-patch.sh -c -H -o changes.patch     # h: (hash) guard
+tools/changes-to-patch.sh -c --normalize -o changes.patch  # token-normalized, h:
 ```
 
 In corpus mode the script checks out the base revision, indexes it, and replaces
 runs of moved/duplicated lines (default: 3+ consecutive lines) with references.
-See `-n/--min-run`, `-x/--exclude`, `-H/--hash`, `--index`, and `--corpus-root`
-in `tools/changes-to-patch.sh --help`.
+With `--normalize`, the indexer and matcher use PHP's tokenizer to collapse
+inter-token whitespace (`while(true)` and `while ( true )` match), while strings,
+heredocs/nowdocs and multi-line tokens stay byte-safe. Normalized references are
+hash-guarded and emitted only when the `r` transform (or exact copy) reproduces
+the destination bytes; semantically-matched but differently formatted lines that
+cannot be represented are left literal. See `-n/--min-run`, `-x/--exclude`,
+`-H/--hash`, `--normalize`, `--index`, and `--corpus-root` in
+`tools/changes-to-patch.sh --help`.
 
 ## OPcache & JIT
 
@@ -408,6 +427,8 @@ tools/changes-to-patch.sh  Turn uncommitted git changes into an ed-script bundle
 tools/indexer.cpp          phpatcher-index: corpus line index for de-duplication.
 tools/matcher.cpp          phpatcher-match: factorize a block into corpus refs.
 tools/matcher_core.hpp     Reusable factorization algorithm (unit-tested).
+tools/normalize.php        PHP tokenizer coprocess for normalized matching.
+tools/normalizer.hpp       C++ client for the tokenizer coprocess.
 tools/Makefile             Build the helper tools (`make -C tools`).
 tests/*.phpt               PHP integration tests (run via `make test`).
 tests/fixtures/            Fixtures for the integration tests.

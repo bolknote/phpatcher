@@ -106,12 +106,20 @@ inline bool ref_hash_parse(std::string_view hex, RefHash& out) {
  * carries. Exactly one of `bytes >= 0` / `has_hash` is set.
  */
 struct EdRef {
+    enum Transform : std::uint8_t {
+        Exact,      /* insert resolved lines unchanged                       */
+        TrimPad     /* insert lpad + trim(resolved line) + rpad per line     */
+    };
+
     std::string path;        /* file path, relative to the patch base_dir       */
     std::int64_t begin = 0;  /* inclusive, 1-based first line                    */
     std::int64_t end = 0;    /* inclusive, 1-based last line                     */
     std::int64_t bytes = -1; /* expected byte length of the run (s:); <0 if none */
     bool has_hash = false;   /* whether `hash` carries an expected value (h:)    */
     RefHash hash;            /* expected content hash, valid iff has_hash        */
+    Transform transform = Exact;
+    std::string lpad;        /* used by TrimPad                                  */
+    std::string rpad;        /* used by TrimPad                                  */
 };
 
 /* One element of an ed input block: either a literal line or a corpus reference

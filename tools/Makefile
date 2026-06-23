@@ -12,10 +12,10 @@ BINS := phpatcher-index phpatcher-match
 
 all: $(BINS)
 
-phpatcher-index: indexer.cpp
+phpatcher-index: indexer.cpp normalizer.hpp
 	$(CXX) $(CXXFLAGS) -o $@ indexer.cpp
 
-phpatcher-match: matcher.cpp matcher_core.hpp ../patch.hpp
+phpatcher-match: matcher.cpp matcher_core.hpp normalizer.hpp ../patch.hpp
 	$(CXX) $(CXXFLAGS) -o $@ matcher.cpp
 
 clean:

@@ -13,12 +13,14 @@
 #include <unordered_map>
 #include <vector>
 
+using phpatcher::match::EqualFn;
 using phpatcher::match::factorize;
-using phpatcher::match::LineFn;
 using phpatcher::match::Posting;
 using phpatcher::match::PostingsFn;
 using phpatcher::match::Run;
 using phpatcher::match::trim;
+
+#include <functional>
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -86,6 +88,7 @@ public:
             return it == postings_.end() ? nullptr : &it->second;
         };
     }
+    using LineFn = std::function<const std::string_view*(std::uint32_t, std::uint32_t)>;
     LineFn line_fn() const {
         return [this](std::uint32_t f, std::uint32_t ln) -> const std::string_view* {
             if (f >= files_.size() || ln == 0 || ln > files_[f].views.size()) return nullptr;
@@ -98,8 +101,19 @@ private:
     std::unordered_map<std::string, std::vector<Posting>> postings_;
 };
 
+/* Factorize using trimmed keys and byte-exact equality — the byte-index
+ * behaviour the CLI uses when the index is not normalized. */
 std::vector<Run> run(const TestCorpus& c, const Lines& block, std::size_t min_run) {
-    return factorize(block.views, min_run, c.postings_fn(), c.line_fn());
+    std::vector<std::string_view> keys;
+    keys.reserve(block.views.size());
+    for (std::string_view v : block.views) keys.push_back(trim(v));
+
+    const auto line = c.line_fn();
+    EqualFn equal = [&block, line](std::size_t bpos, std::uint32_t f, std::uint32_t ln) {
+        const std::string_view* cl = line(f, ln);
+        return cl != nullptr && *cl == block.views[bpos];
+    };
+    return factorize(keys, min_run, c.postings_fn(), equal);
 }
 
 }  // namespace
@@ -196,6 +210,40 @@ static void test_byte_exact_precision() {
     CHECK_EQ(run(c, block, 1).size(), static_cast<std::size_t>(0));
 }
 
+/* The same greedy core can be driven by normalized keys/equality: raw bytes
+ * differ, but the caller's normalized keys match, so the run is accepted. */
+static void test_normalized_strategy_matches_reformatted_code() {
+    std::unordered_map<std::string, std::vector<Posting>> postings;
+    postings["while ( true ) {"].push_back({0, 1});
+    postings["return foo ( $a , $b ) ;"].push_back({0, 2});
+
+    const std::vector<std::string_view> block_keys = {
+        "while ( true ) {",
+        "return foo ( $a , $b ) ;",
+    };
+    const std::vector<std::string_view> corpus_keys = {
+        "while ( true ) {",
+        "return foo ( $a , $b ) ;",
+    };
+
+    PostingsFn postings_fn = [&](std::string_view k) -> const std::vector<Posting>* {
+        auto it = postings.find(std::string(k));
+        return it == postings.end() ? nullptr : &it->second;
+    };
+    EqualFn equal = [&](std::size_t bpos, std::uint32_t f, std::uint32_t ln) {
+        return f == 0 && ln >= 1 && ln <= corpus_keys.size() &&
+               block_keys[bpos] == corpus_keys[ln - 1];
+    };
+
+    const std::vector<Run> runs = factorize(block_keys, 2, postings_fn, equal);
+    CHECK_EQ(runs.size(), static_cast<std::size_t>(1));
+    if (runs.size() == 1) {
+        CHECK_EQ(runs[0].length(), static_cast<std::size_t>(2));
+        CHECK_EQ(runs[0].corpus_begin, 1u);
+        CHECK_EQ(runs[0].corpus_end, 2u);
+    }
+}
+
 /* With two corpus occurrences of the anchor, the longest extension wins. */
 static void test_longest_candidate_wins() {
     TestCorpus c;
@@ -258,6 +306,7 @@ int main() {
     test_mixed_literals_and_copies();
     test_extension_over_unindexed_line();
     test_byte_exact_precision();
+    test_normalized_strategy_matches_reformatted_code();
     test_longest_candidate_wins();
     test_no_match();
     test_two_nonoverlapping_runs();

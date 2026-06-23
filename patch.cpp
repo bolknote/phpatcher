@@ -90,6 +90,13 @@ string_view rtrim(string_view s) {
     return s;
 }
 
+string_view trim_blanks(string_view s) {
+    while (!s.empty() && is_blank(s.front())) {
+        s.remove_prefix(1);
+    }
+    return rtrim(s);
+}
+
 /* Read a non-negative decimal integer at `s[pos]`, advancing `pos` past it.
  * Returns false when no digit is present or the value would overflow int64. */
 bool read_uint(string_view s, std::size_t& pos, std::int64_t& out) {
@@ -233,10 +240,104 @@ bool parse_decimal_full(string_view s, std::int64_t& out) {
     return true;
 }
 
+bool parse_quoted(string_view s, std::size_t& pos, std::string& out) {
+    if (pos >= s.size() || s[pos] != '"') return false;
+    ++pos;
+    out.clear();
+    while (pos < s.size()) {
+        const char c = s[pos++];
+        if (c == '"') return true;
+        if (c == '\\') {
+            if (pos >= s.size()) return false;
+            const char e = s[pos++];
+            switch (e) {
+                case '\\': out.push_back('\\'); break;
+                case '"':  out.push_back('"'); break;
+                case 't':  out.push_back('\t'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 'n':  out.push_back('\n'); break;
+                default:   return false;
+            }
+        } else {
+            out.push_back(c);
+        }
+    }
+    return false;
+}
+
+bool parse_guard_tokens(string_view meta, EdRef& ref) {
+    bool have_guard = false;
+    while (!meta.empty()) {
+        const std::size_t sp = meta.find(' ');
+        const string_view tok = meta.substr(0, sp);
+        if (tok.substr(0, 2) == "s:") {
+            if (!parse_decimal_full(tok.substr(2), ref.bytes)) return false;
+            have_guard = true;
+        } else if (tok.substr(0, 2) == "h:") {
+            if (!ref_hash_parse(tok.substr(2), ref.hash)) return false;
+            ref.has_hash = true;
+            have_guard = true;
+        } else if (!tok.empty()) {
+            return false;  /* unknown token: not our directive */
+        }
+        if (sp == npos) break;
+        meta.remove_prefix(sp + 1);
+    }
+    return have_guard;
+}
+
+void skip_blanks(string_view s, std::size_t& pos) {
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t')) ++pos;
+}
+
+bool parse_r_directive(string_view line, EdRef& ref) {
+    if (line.substr(0, 2) != "r ") return false;
+    std::size_t pos = 2;
+    skip_blanks(line, pos);
+
+    std::string path;
+    if (pos < line.size() && line[pos] == '"') {
+        if (!parse_quoted(line, pos, path)) return false;
+    } else {
+        const std::size_t start = pos;
+        while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') ++pos;
+        if (pos == start) return false;
+        path = std::string(line.substr(start, pos - start));
+    }
+
+    skip_blanks(line, pos);
+    std::int64_t begin = 0, end = 0;
+    if (!read_uint(line, pos, begin)) return false;
+    skip_blanks(line, pos);
+    if (!read_uint(line, pos, end)) return false;
+    if (begin < 1 || end < begin) return false;
+
+    ref = EdRef{};
+    ref.path = std::move(path);
+    ref.begin = begin;
+    ref.end = end;
+
+    skip_blanks(line, pos);
+    if (pos < line.size() && line[pos] == '"') {
+        if (!parse_quoted(line, pos, ref.lpad)) return false;
+        skip_blanks(line, pos);
+        if (!parse_quoted(line, pos, ref.rpad)) return false;
+        ref.transform = EdRef::TrimPad;
+        skip_blanks(line, pos);
+    }
+
+    if (pos + 2 > line.size() || line.substr(pos, 2) != "# ") return false;
+    return parse_guard_tokens(line.substr(pos + 2), ref);
+}
+
 /* Parse one ed input-block line into a piece. A line is treated as a corpus
- * reference only if it fully matches
+ * reference only if it fully matches either the legacy shell-friendly form
  *
  *     !sed -n 'A,B p[;B q]' PATH  # <guard>
+ *
+ * or the native phpatcher form
+ *
+ *     r "PATH" A B ["lpad" "rpad"] # <guard>
  *
  * The optional ";B q" (sed early-exit) is accepted but ignored — phpatcher
  * slices the file itself and never runs sed. <guard> is space-separated
@@ -248,6 +349,11 @@ EdPiece parse_ed_input_piece(string_view line) {
     constexpr string_view kMetaIntro = "# ";
 
     const auto literal = [&]() { return EdPiece(std::string(line)); };
+
+    EdRef native_ref;
+    if (parse_r_directive(line, native_ref)) {
+        return EdPiece(std::move(native_ref));
+    }
 
     if (line.substr(0, kRefPrefix.size()) != kRefPrefix) return literal();
     std::size_t pos = kRefPrefix.size();
@@ -287,31 +393,13 @@ EdPiece parse_ed_input_piece(string_view line) {
     while (!path.empty() && path.back() == ' ') path.remove_suffix(1);
     if (path.empty() || begin < 1 || end < begin) return literal();
 
-    /* Parse the guard tokens. */
     EdRef ref;
     ref.path = std::string(path);
     ref.begin = begin;
     ref.end = end;
 
     string_view meta = rest.substr(marker + kMetaIntro.size());
-    bool have_guard = false;
-    while (!meta.empty()) {
-        const std::size_t sp = meta.find(' ');
-        const string_view tok = meta.substr(0, sp);
-        if (tok.substr(0, 2) == "s:") {
-            if (!parse_decimal_full(tok.substr(2), ref.bytes)) return literal();
-            have_guard = true;
-        } else if (tok.substr(0, 2) == "h:") {
-            if (!ref_hash_parse(tok.substr(2), ref.hash)) return literal();
-            ref.has_hash = true;
-            have_guard = true;
-        } else if (!tok.empty()) {
-            return literal();  /* unknown token: not our directive */
-        }
-        if (sp == npos) break;
-        meta.remove_prefix(sp + 1);
-    }
-    if (!have_guard) return literal();
+    if (!parse_guard_tokens(meta, ref)) return literal();
 
     return EdPiece(std::move(ref));
 }
@@ -337,7 +425,15 @@ bool build_input(const std::vector<EdPiece>& input, const PatchSet::RefResolver&
             return false;
         }
         for (std::string& l : resolved) {
-            storage.push_back(std::move(l));
+            if (ref.transform == EdRef::TrimPad) {
+                std::string t = ref.lpad;
+                const string_view core = trim_blanks(l);
+                t.append(core.data(), core.size());
+                t += ref.rpad;
+                storage.push_back(std::move(t));
+            } else {
+                storage.push_back(std::move(l));
+            }
             out.emplace_back(storage.back());
         }
     }

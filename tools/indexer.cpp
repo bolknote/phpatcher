@@ -48,12 +48,18 @@
 #include <unordered_set>
 #include <vector>
 
+#include "normalizer.hpp"
+
 namespace fs = std::filesystem;
+
+using phpatcher::tools::NormLine;
+using phpatcher::tools::Normalizer;
 
 namespace {
 
 constexpr char kMagic[4] = {'P', 'H', 'I', 'X'};
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;
+constexpr std::uint32_t kFlagNormalized = 1u << 0;
 
 struct Options {
     std::string root = ".";
@@ -64,6 +70,9 @@ struct Options {
     std::string output;
     bool dump = false;
     bool verbose = false;
+    bool normalize = false;        /* tokenize via php coprocess */
+    std::string php = "php";       /* php interpreter for normalization */
+    std::string normalizer;        /* path to normalize.php (default: next to argv0) */
 };
 
 void usage(const char *argv0) {
@@ -80,6 +89,9 @@ void usage(const char *argv0) {
         "  -c, --max-postings N  drop lines occurring > N times (default: 64; 0 = no cap)\n"
         "  -o, --output FILE     write the binary index to FILE\n"
         "      --dump            print the index as text to stdout\n"
+        "  -n, --normalize       tokenize via php and collapse inter-token whitespace\n"
+        "      --php PATH         php interpreter for --normalize (default: php)\n"
+        "      --normalizer PATH  path to normalize.php (default: next to this binary)\n"
         "  -v, --verbose         report stats and the most common lines to stderr\n"
         "  -h, --help            show this help\n\n"
         "Without -o/--dump the tool only scans and reports statistics.\n",
@@ -181,15 +193,17 @@ void put(std::string &buf, T v) {
 }
 
 /* Binary layout (native endianness):
- *   magic[4] "PHIX", u32 version, u32 min_len, u32 max_postings,
+ *   magic[4] "PHIX", u32 version, u32 flags, u32 min_len, u32 max_postings,
  *   u32 file_count, { u16 len, bytes }*,
  *   u32 key_count,  { u32 len, bytes, u32 n, { u32 file_id, u32 lineno }* }*
+ * flags bit 0 = keys are php-token-normalized (matcher must normalize too).
  * Keys with > max_postings occurrences are omitted. */
 bool write_index(const Index &idx, const Options &opt, std::size_t &keys_written,
                  std::size_t &postings_written) {
     std::string buf;
     buf.append(kMagic, sizeof(kMagic));
     put<std::uint32_t>(buf, kVersion);
+    put<std::uint32_t>(buf, opt.normalize ? kFlagNormalized : 0u);
     put<std::uint32_t>(buf, static_cast<std::uint32_t>(opt.min_len));
     put<std::uint32_t>(buf, static_cast<std::uint32_t>(opt.max_postings));
 
@@ -248,6 +262,9 @@ int main(int argc, char **argv) {
         else if (a == "-c" || a == "--max-postings") opt.max_postings = parse_uint(a, next(a.c_str()));
         else if (a == "-o" || a == "--output") opt.output = next(a.c_str());
         else if (a == "--dump") opt.dump = true;
+        else if (a == "-n" || a == "--normalize") opt.normalize = true;
+        else if (a == "--php") opt.php = next(a.c_str());
+        else if (a == "--normalizer") opt.normalizer = next(a.c_str());
         else if (a == "-v" || a == "--verbose") opt.verbose = true;
         else if (!a.empty() && a[0] == '-') die("unknown option: " + a);
         else opt.root = a;
@@ -259,6 +276,20 @@ int main(int argc, char **argv) {
     const fs::path root = fs::path(opt.root);
 
     const std::unordered_set<std::string> exts(opt.exts.begin(), opt.exts.end());
+
+    Normalizer normalizer;
+    if (opt.normalize) {
+        if (opt.normalizer.empty()) {
+            fs::path self(argv[0]);
+            fs::path dir = self.parent_path();
+            opt.normalizer = (dir.empty() ? fs::path("normalize.php")
+                                          : dir / "normalize.php").string();
+        }
+        if (!fs::exists(opt.normalizer))
+            die("normalizer script not found: " + opt.normalizer +
+                " (pass --normalizer PATH)");
+        normalizer.start(opt.php, opt.normalizer);
+    }
 
     Index idx;
     std::size_t scanned_files = 0, matched_files = 0, excluded_dirs = 0;
@@ -294,6 +325,39 @@ int main(int argc, char **argv) {
         /* Assign a file id lazily, only if the file contributes a posting. */
         std::uint32_t file_id = 0;
         bool have_id = false;
+        const auto ensure_id = [&] {
+            if (!have_id) {
+                file_id = static_cast<std::uint32_t>(idx.files.size());
+                idx.files.push_back(fs::relative(entry.path(), root, ec2).string());
+                have_id = true;
+            }
+            return file_id;
+        };
+
+        if (opt.normalize) {
+            /* The coprocess returns one key per physical line, in order, so the
+             * vector index + 1 is the 1-based line number on disk. Indivisible
+             * lines (flag 1, e.g. heredoc bodies) are indexed verbatim and skip
+             * the min-len filter; normal lines carry collapsed whitespace. */
+            const std::vector<NormLine> keys = normalizer.run(content);
+            for (std::size_t i = 0; i < keys.size(); ++i) {
+                ++total_lines;
+                const NormLine &nl = keys[i];
+                if (nl.key.empty()) continue;
+                ++nonempty_lines;
+                /* min-len is judged on the trimmed length so an indented
+                 * indivisible PHPDoc marker (raw key, but only a couple of
+                 * significant chars once trimmed) is filtered as the garbage
+                 * anchor it is. Normalized keys carry no surrounding whitespace,
+                 * so trim() is a no-op for them; the stored key stays raw for
+                 * indivisible (flag==1) lines. */
+                if (trim(std::string_view(nl.key)).size() < opt.min_len) continue;
+                idx.lines[nl.key].push_back(
+                    pack(ensure_id(), static_cast<std::uint32_t>(i + 1)));
+                ++indexed_lines;
+            }
+            continue;
+        }
 
         std::uint32_t lineno = 0;
         std::size_t start = 0;
@@ -309,12 +373,7 @@ int main(int argc, char **argv) {
                 if (norm.empty()) continue;
                 ++nonempty_lines;
                 if (norm.size() < opt.min_len) continue;
-                if (!have_id) {
-                    file_id = static_cast<std::uint32_t>(idx.files.size());
-                    idx.files.push_back(fs::relative(entry.path(), root, ec2).string());
-                    have_id = true;
-                }
-                idx.lines[std::string(norm)].push_back(pack(file_id, lineno));
+                idx.lines[std::string(norm)].push_back(pack(ensure_id(), lineno));
                 ++indexed_lines;
             }
         }
