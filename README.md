@@ -35,19 +35,22 @@ that the engine calls for every file it compiles. OPcache, Xdebug, Blackfire and
 many other extensions hook it. phpatcher does the same:
 
 1. At module startup (`MINIT`) it reads the configured patch file, parses every
-   file section and indexes it by canonical absolute path (a hash map for O(1)
-   lookup).
-2. It installs its `zend_compile_file` hook at the head of the chain (always
-   calling the previous handler, e.g. OPcache, afterwards).
-3. When the engine is about to compile a file, the hook resolves the file's real
-   path. If a patch exists for it, phpatcher hands the patched bytes to the
+   file section and indexes it by canonical absolute path (a sorted vector for
+   cache-friendly `O(log n)` lookup).
+2. It registers a `zend_compile_file` hook and always chains to the previous
+   handler (final order depends on extension load order; see [Load order](#load-order)).
+3. When the engine is about to compile a file, the hook first checks whether the
+   basename could be patched. Only possible matches pay for canonical path
+   resolution. If a patch exists, phpatcher hands the patched bytes to the
    compiler via the file handle's in-memory buffer (`zend_file_handle.buf`). The
    on-disk file is left untouched. By default the patched bytes are prepared once
    at startup (`phpatcher.precompute`), so the hot path is a lock-free lookup; see
    [Memory model](#memory-model-php-fpm).
 
-A fast, syscall-free pre-filter on the file's basename means files that are not
-in the patch pay only a single hash lookup — no `realpath()`, no I/O.
+A fast, syscall-free pre-filter on the file's basename means files whose basename
+is absent from the patch pay only that check — no `realpath()`, no I/O. Files
+that merely share a patched basename still do the canonical lookup, then miss the
+full-path index.
 
 > **Note:** this hooks the engine's extension API — it does **not** modify,
 > recompile or patch the PHP interpreter itself. Nothing in php-src is changed.
@@ -59,7 +62,8 @@ in the patch pay only a single hash lookup — no `realpath()`, no I/O.
   stable across the 8.x series. CI runs the suite on 8.2, 8.3 and 8.4.
 - A C++17 compiler (clang or gcc).
 - `phpize` / `php-config` (the PHP development headers).
-- `libgit2` + `pkg-config` for the helper tools (`phpatcher-changes`).
+- `libgit2` + `pkg-config` for `tools/phpatcher-changes` (the other helper
+  tools are standalone C++17 programs).
 
 ## Build & install
 
@@ -151,7 +155,7 @@ inserted line
 .
 ```
 
-- The file must begin with the `# phpatcher-ed` magic line.
+- The first non-blank line must be the `# phpatcher-ed` magic line.
 - `# file: <path>` starts each file section (path resolved against
   `phpatcher.base_dir`).
 - Supported edit commands: `Na` (append after line N), `Ni` (insert before N),
@@ -194,7 +198,7 @@ It instructs phpatcher to insert lines `A..B` (inclusive, 1-based) of
 A reference may also carry a byte transform:
 
 ```
-r "path/to/original.php" A B "left-pad" "right-pad"  # h:<hash>
+r "path/to/original.php" A B "left-pad" "right-pad"  # s:<byte-length>
 ```
 
 which inserts `left-pad + trim(line) + right-pad` for each resolved line. This is
@@ -203,8 +207,8 @@ generator leaves that line literal.
 
 The trailing token is a **drift guard**, verified against the file on disk; if it
 does not match, the patch for that file **fails** (subject to
-`phpatcher.on_error`) instead of silently inserting the wrong code. The patch
-carries exactly one guard, and phpatcher checks whichever is present:
+`phpatcher.on_error`) instead of silently inserting the wrong code. Generators
+emit one guard; if a hand-written reference carries both, phpatcher verifies both:
 
 - `s:<n>` — the exact byte length of the referenced run. The cheap default: the
   common path does no hashing at all.
@@ -213,13 +217,14 @@ carries exactly one guard, and phpatcher checks whichever is present:
 
 Because the references read the **pre-patch** source, the referenced files must
 match the code deployed on the target — exactly the sources phpatcher reads to
-apply the patch. A line that merely starts with `r` but is not a complete,
-guarded directive is treated as ordinary literal text.
+apply the patch. Paths may be quoted (recommended) or unquoted when they contain
+no whitespace. A line that merely starts with `r` but is not a complete, guarded
+directive is treated as ordinary literal text.
 
 Generate references automatically with `-c`:
 
 ```bash
-make -C tools                     # build helper tools (requires libgit2)
+make -C tools                     # build all helper tools (phpatcher-changes requires libgit2)
 
 # Build (or reuse) the corpus checkout and index:
 git archive "$BASE" | tar -x -C corpus
@@ -244,7 +249,12 @@ multi-line tokens stay byte-safe. Normalized references are emitted only when th
 `r` transform (or exact copy) reproduces the destination bytes;
 semantically-matched but differently formatted lines that cannot be represented
 are left literal. The shell `tools/changes-to-patch.sh` delegates to the
-libgit2 tool.
+libgit2 tool and can also build a temporary base checkout plus corpus index for
+`-c` when `--index` / `--corpus-root` are omitted:
+
+```bash
+tools/changes-to-patch.sh -b "$BASE" -c --normalize -o changes_norm.patch
+```
 
 ## OPcache & JIT
 
@@ -274,8 +284,8 @@ tested against both (see `tests/008-opcache-jit.phpt`).
 > anyway, since `phpatcher.patch_file` is `PHP_INI_SYSTEM` and read once at
 > `MINIT`).
 >
-> If you set `phpatcher.opcache_bind=0`, you are back to manual invalidation, and
-> it is worth knowing exactly what works (all verified):
+> If you set `phpatcher.opcache_bind=0`, you are back to manual invalidation. The
+> important OPcache behaviour is:
 >
 > - A real SAPI **restart** recreates the (anonymous) SHM segment, so the SHM
 >   cache comes up fresh on its own.
@@ -327,9 +337,9 @@ CPU for memory, see the `precompute`/`cache` knobs above.
 
 ## Behaviour & guarantees
 
-- **Never a broken hybrid.** If a patch does not apply (e.g. the source has
-  changed and the context no longer matches), phpatcher never produces a
-  partially-patched file. With `phpatcher.on_error=original` (default) it
+- **Never a broken hybrid.** If a patch does not apply (e.g. the deployed source
+  has drifted from the line numbers or corpus guards in the patch), phpatcher
+  never produces a partially-patched file. With `phpatcher.on_error=original` (default) it
   compiles the *original* file (fail-open); with `phpatcher.on_error=fail` it
   compiles a throwing stub so the unpatched code does not run (fail-closed). In
   strict mode it also emits a warning, and every failure is counted (see
@@ -347,7 +357,8 @@ CPU for memory, see the `precompute`/`cache` knobs above.
   segments and case-insensitive filesystems resolve consistently between the
   index and the file the engine actually compiles.
 - **Only listed files are touched.** Any file not present in the patch index is
-  compiled completely untouched (zero overhead beyond a hash-map lookup).
+  compiled completely untouched. Most misses stop at the basename pre-filter;
+  same-basename misses also pay the canonical-path lookup.
 - **Thread-safe.** The patch index is immutable after startup; the patched-output
   cache is mutex-guarded for ZTS builds.
 
@@ -385,7 +396,7 @@ phpatcher_stats(): array      // runtime counters (see below)
 Use `precomputed_bytes` to size the shared cost and `cached_bytes` to watch
 per-worker growth. Watch `apply_failures` / `read_failures` (and `last_error`)
 to detect a patch that has silently stopped applying — e.g. after a vendor
-update shifted the context — especially when `display_errors`/logging would hide
+update shifted the source — especially when `display_errors`/logging would hide
 the `E_WARNING`. `phpinfo()` / `php --ri phpatcher` also report the version,
 active state, indexed file count and the precomputed file count and byte size.
 
@@ -405,9 +416,9 @@ active state, indexed file count and the precomputed file count and byte size.
 
 - Targets plain filesystem includes. Sources loaded through stream wrappers
   (e.g. `phar://`) are not patched.
-- The patch index covers files that exist on disk. Patches that create brand new
-  files (`--- /dev/null`) are not served, since such a file cannot be `include`d
-  from disk in the first place.
+- The patch index covers files that exist on disk. Patches for newly added files
+  are not served, since such a file cannot be `include`d from disk in the first
+  place. `phpatcher-changes` emits only modified text files.
 - Patch application is strict (no fuzz): line-addressed edits and corpus
   reference guards must match the deployed source exactly.
 - Files using `__halt_compiler()` are never patched (their data offset cannot be
@@ -424,7 +435,8 @@ patch.hpp / patch.cpp      Pure C++ core: phpatcher-ed parser, applier, index.
 phpatcher.cpp              PHP glue: INI, lifecycle, the zend_compile_file hook.
 php_phpatcher.h            Module header.
 config.m4                  Build configuration (C++17).
-tools/changes-to-patch.sh  Turn uncommitted git changes into an ed-script bundle.
+tools/changes-to-patch.sh  Wrapper for phpatcher-ed generation from git diffs
+                           (working tree or revision-to-revision).
 tools/changes.cpp          phpatcher-changes: fast libgit2 ed-bundle generator.
 tools/indexer.cpp          phpatcher-index: corpus line index for de-duplication.
 tools/matcher.cpp          phpatcher-match: factorize a block into corpus refs.
@@ -434,7 +446,7 @@ tools/normalizer.hpp       C++ client for the tokenizer coprocess.
 tools/Makefile             Build the helper tools (`make -C tools`).
 tests/*.phpt               PHP integration tests (run via `make test`).
 tests/fixtures/            Fixtures for the integration tests.
-tests/unit/                Standalone C++ unit tests for the core.
+tests/unit/                Standalone C++ unit tests for the patch and matcher cores.
 ```
 
 ## Running the tests
@@ -443,9 +455,10 @@ tests/unit/                Standalone C++ unit tests for the core.
 # PHP integration tests
 make test
 
-# C++ unit tests for the core (no PHP needed)
-./tests/unit/run.sh          # or: make -C tests/unit
-make -C tests/unit sanitize  # under AddressSanitizer + UndefinedBehaviorSanitizer
+# C++ unit tests (no PHP needed)
+./tests/unit/run.sh          # patch core + matcher core
+make -C tests/unit           # patch core only (same target CI runs)
+make -C tests/unit sanitize  # patch core under AddressSanitizer + UBSan
 ```
 
 ## License

@@ -2,8 +2,8 @@
  * phpatcher - PHP extension entry point.
  *
  * Hooks the engine's `zend_compile_file` function pointer (the same supported
- * extension point used by OPcache/Xdebug) to transparently apply a unified
- * diff to PHP source files *in memory* right before they are compiled. The
+ * extension point used by OPcache/Xdebug) to transparently apply phpatcher-ed
+ * patches to PHP source files *in memory* right before they are compiled. The
  * files on disk are never modified.
  */
 
