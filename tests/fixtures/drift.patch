@@ -1,0 +1,5 @@
+# phpatcher-ed v1
+# file: fixtures/drift_src.php
+2a
+r "fixtures/ref_donor.php" 2 5 # s:9999
+.

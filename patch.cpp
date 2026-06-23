@@ -7,7 +7,7 @@
  *
  * Performance notes:
  *   - Parsing and application work over std::string_view slices of the caller's
- *     buffers; only the data that must outlive the call (hunk/ed bodies, index
+ *     buffers; only the data that must outlive the call (ed input blocks, index
  *     keys, the final output) is materialised into owning std::strings.
  *   - The index is a flat array sorted by canonical path; lookups are O(log n)
  *     via binary search, and the contiguous storage is cache- and COW-friendly.
@@ -332,10 +332,54 @@ bool build_input(const std::vector<EdPiece>& input, const PatchSet::RefResolver&
     return true;
 }
 
+/* Verify the commands address strictly descending, non-overlapping ranges in the
+ * *original* file. phpatcher's format mandates this (its generators always emit
+ * it) precisely so that applying the commands sequentially to the mutating buffer
+ * is identical to addressing the original line numbers. Any other ordering is
+ * order-dependent: applied verbatim it would silently produce different output
+ * than intended, so we reject it (fail-closed) rather than guess.
+ *
+ * For each command we track the lowest original line affected so far (`barrier`)
+ * and require the next command's highest addressed line to sit strictly below it. */
+bool validate_command_order(const FilePatch& fp, std::string& error) {
+    std::int64_t barrier = INT64_MAX;  /* lowest original line touched so far */
+    for (const EdCommand& c : fp.commands) {
+        std::int64_t addressed_top = 0;  /* highest original line it needs in place  */
+        std::int64_t affected_low = 0;   /* lowest original line it consumes/shifts   */
+        switch (c.kind) {
+            case EdCommand::Delete:
+            case EdCommand::Change:
+                addressed_top = c.end;       /* needs lines c.start..c.end present */
+                affected_low = c.start;      /* consumes from c.start upward       */
+                break;
+            case EdCommand::Append:          /* inserts after line c.start (c.start may be 0) */
+                addressed_top = c.start;     /* anchor line must be in place       */
+                affected_low = c.start + 1;  /* shifts everything after the anchor */
+                break;
+            case EdCommand::Insert:          /* inserts before line c.start */
+                addressed_top = c.start;     /* anchor line must be in place       */
+                affected_low = c.start;      /* shifts the anchor and below-after  */
+                break;
+        }
+        if (addressed_top >= barrier) {
+            error = "ed commands must be in descending, non-overlapping line order";
+            return false;
+        }
+        if (affected_low < barrier) {
+            barrier = affected_low;
+        }
+    }
+    return true;
+}
+
 /* Apply a phpatcher-ed FilePatch to `original`. Corpus references are expanded via
  * `resolve`; an ed script without references does not need one. */
 bool apply_ed_script(const FilePatch& fp, string_view original, std::string& out,
                      std::string& error, const PatchSet::RefResolver& resolve) {
+    if (!validate_command_order(fp, error)) {
+        return false;
+    }
+
     bool ends_nl = false;
     std::vector<string_view> lines = split_lines(original, ends_nl);
     if (original.empty()) {

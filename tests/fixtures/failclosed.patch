@@ -1,0 +1,5 @@
+# phpatcher-ed v1
+# file: fixtures/failclosed_src.php
+99c
+function failclosed_value() { return 2; }
+.

@@ -1,0 +1,5 @@
+# phpatcher-ed v1
+# file: fixtures/halt_src.php
+2c
+function halt_value() { return "PATCHED"; }
+.

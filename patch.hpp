@@ -78,9 +78,10 @@ inline bool ref_hash_parse(std::string_view hex, RefHash& out) {
  * against the deployed tree having drifted from the one the patch was generated
  * against.
  *
- * The guard is *either* the exact byte length (`s:`, the cheap default) *or* a
- * 128-bit content hash (`h:`, opt-in for the paranoid) — whichever the patch
- * carries. Exactly one of `bytes >= 0` / `has_hash` is set.
+ * The guard is the exact byte length (`s:`, the cheap default) and/or a 128-bit
+ * content hash (`h:`, opt-in for the paranoid). At least one must be present;
+ * when both are, both are verified. `bytes >= 0` indicates an `s:` guard and
+ * `has_hash` an `h:` guard.
  */
 struct EdRef {
     enum Transform : std::uint8_t {
@@ -184,10 +185,13 @@ public:
 
     /*
      * Apply `fp` to `original`, producing `out`. Returns false and fills
-     * `error` if the patch does not cleanly apply (context/removal mismatch,
-     * out-of-range or overlapping edits). apply() itself never touches the
-     * filesystem; a patch that contains corpus references needs a `resolve`
-     * callback to expand them, and without one such a reference is an error.
+     * `error` if the patch does not cleanly apply: an address out of range, or
+     * commands that are not in strictly descending, non-overlapping line order
+     * (the order phpatcher's generators always emit, required so sequential
+     * application matches the original line numbers). apply() itself never
+     * touches the filesystem; a patch that contains corpus references needs a
+     * `resolve` callback to expand them, and without one such a reference is an
+     * error.
      */
     [[nodiscard]] static bool apply(const FilePatch& fp, const std::string& original,
                                     std::string& out, std::string& error,

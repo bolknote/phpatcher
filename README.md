@@ -160,8 +160,11 @@ inserted line
   `phpatcher.base_dir`).
 - Supported edit commands: `Na` (append after line N), `Ni` (insert before N),
   `M,Nc` / `Nc` (change), `M,Nd` / `Nd` (delete). Each `a/c/i` input block ends
-  with a lone `.` line. Commands are applied in order, so generators emit them in
-  descending line order to avoid line-number shifts.
+  with a lone `.` line. Commands are applied in order, so they must address
+  **strictly descending, non-overlapping** line ranges (the order generators
+  emit) — that way sequential application matches the original line numbers. A
+  bundle that violates this is rejected (fail-closed, subject to
+  `phpatcher.on_error`) rather than risk silently producing the wrong output.
 - Limitation: a replacement line consisting solely of `.` cannot be represented
   (inherited from the ed-style input-block terminator). PHP source effectively
   never has one.
@@ -447,6 +450,7 @@ tools/Makefile             Build the helper tools (`make -C tools`).
 tests/*.phpt               PHP integration tests (run via `make test`).
 tests/fixtures/            Fixtures for the integration tests.
 tests/unit/                Standalone C++ unit tests for the patch and matcher cores.
+tests/tools/roundtrip.sh   Round-trip smoke test for phpatcher-changes (needs the tools).
 ```
 
 ## Running the tests
@@ -459,6 +463,9 @@ make test
 ./tests/unit/run.sh          # patch core + matcher core
 make -C tests/unit           # patch core only (same target CI runs)
 make -C tests/unit sanitize  # patch core under AddressSanitizer + UBSan
+
+# Generator round-trip (needs git, ed, and the libgit2-based tools)
+make -C tools && ./tests/tools/roundtrip.sh
 ```
 
 ## License
