@@ -1,0 +1,5 @@
+# phpatcher-ed v1
+# newfile: fixtures/virtual_helper.php
+<?php
+function helper_value() { return "FROM-MEMORY"; }
+.

@@ -180,17 +180,28 @@ static bool phpatcher_canonical_path(zend_file_handle *fh, std::string &out) {
     } else if (fh->filename) {
         resolved = zend_resolve_path(fh->filename);
     }
-    if (!resolved) {
-        return false;
+    if (resolved) {
+        char real[MAXPATHLEN];
+        if (VCWD_REALPATH(ZSTR_VAL(resolved), real)) {
+            out.assign(real);
+        } else {
+            out.assign(ZSTR_VAL(resolved), ZSTR_LEN(resolved));
+        }
+        zend_string_release(resolved);
+        return true;
     }
-    char real[MAXPATHLEN];
-    if (VCWD_REALPATH(ZSTR_VAL(resolved), real)) {
-        out.assign(real);
-    } else {
-        out.assign(ZSTR_VAL(resolved), ZSTR_LEN(resolved));
+
+    /* The engine could not resolve the path: the file does not exist on disk.
+     * This is the normal case for a "# newfile:" virtual file. Normalize the
+     * requested name exactly the way PatchSet::canonicalize() keyed the index
+     * (lexical normalization, anchored at base_dir when relative) so a created
+     * file still matches its patch entry. */
+    if (fh->filename) {
+        out = phpatcher::PatchSet::canonicalize(
+            std::string(ZSTR_VAL(fh->filename), ZSTR_LEN(fh->filename)), g_base_dir);
+        return true;
     }
-    zend_string_release(resolved);
-    return true;
+    return false;
 }
 
 /* Find the patch for the file about to be compiled, or nullptr. On a hit, `path`
@@ -363,24 +374,29 @@ static PatchStatus phpatcher_get_patched(const std::string &path,
     }
 
     std::string original;
-    if (!phpatcher::read_file(path, original)) {
-        g_read_failures.fetch_add(1, std::memory_order_relaxed);
-        phpatcher_record_error("cannot read original file '" + path + "'");
-        if (PHPATCHER_G(strict)) {
-            php_error_docref(nullptr, E_WARNING,
-                             "phpatcher: cannot read original file '%s'", path.c_str());
+    if (!fp.creates) {
+        /* Ordinary patch: the original lives on disk and is the apply() base. A
+         * created file has no on-disk original, so its base is the empty string
+         * (the "# newfile:" content is a single 0a command). */
+        if (!phpatcher::read_file(path, original)) {
+            g_read_failures.fetch_add(1, std::memory_order_relaxed);
+            phpatcher_record_error("cannot read original file '" + path + "'");
+            if (PHPATCHER_G(strict)) {
+                php_error_docref(nullptr, E_WARNING,
+                                 "phpatcher: cannot read original file '%s'", path.c_str());
+            }
+            return PatchStatus::Fail;
         }
-        return PatchStatus::Fail;
-    }
 
-    if (phpatcher_has_halt_compiler(original)) {
-        g_skipped_halt.fetch_add(1, std::memory_order_relaxed);
-        if (PHPATCHER_G(strict)) {
-            php_error_docref(nullptr, E_WARNING,
-                             "phpatcher: skipping '%s' (__halt_compiler present; "
-                             "patching would shift its data offset)", path.c_str());
+        if (phpatcher_has_halt_compiler(original)) {
+            g_skipped_halt.fetch_add(1, std::memory_order_relaxed);
+            if (PHPATCHER_G(strict)) {
+                php_error_docref(nullptr, E_WARNING,
+                                 "phpatcher: skipping '%s' (__halt_compiler present; "
+                                 "patching would shift its data offset)", path.c_str());
+            }
+            return PatchStatus::Skip;
         }
-        return PatchStatus::Skip;
     }
 
     std::string error;
@@ -570,12 +586,26 @@ static const zend_function_entry phpatcher_functions[] = {
 /* Resolve the base directory used to anchor the patch's relative paths: the
  * configured value, or the process CWD as a fallback. */
 static std::string phpatcher_base_dir() {
+    std::string dir;
     const char *cfg = PHPATCHER_G(base_dir);
     if (cfg != nullptr && cfg[0] != '\0') {
-        return cfg;
+        dir = cfg;
+    } else {
+        char cwd[MAXPATHLEN];
+        if (VCWD_GETCWD(cwd, MAXPATHLEN)) {
+            dir = cwd;
+        }
     }
-    char cwd[MAXPATHLEN];
-    return VCWD_GETCWD(cwd, MAXPATHLEN) ? std::string(cwd) : std::string();
+    /* Canonicalize to the engine's real path so keys for created ("# newfile:")
+     * files — which cannot be realpath()'d because they do not exist — anchor to
+     * the same base the engine derives for __DIR__/__FILE__ at runtime. */
+    if (!dir.empty()) {
+        char real[MAXPATHLEN];
+        if (VCWD_REALPATH(dir.c_str(), real)) {
+            dir.assign(real);
+        }
+    }
+    return dir;
 }
 
 /* Populate g_precomputed with the patched content of every indexed file (see
@@ -592,14 +622,19 @@ static void phpatcher_precompute(const phpatcher::PatchSet &set) {
     const phpatcher::PatchSet::RefResolver resolver = phpatcher_make_resolver(g_base_dir, refcache);
     for (const auto &kv : set.files()) {
         std::string original, patched, error;
-        if (!phpatcher::read_file(kv.first, original)) {
-            continue;
-        }
-        /* Files with __halt_compiler() are never patched (see the runtime guard);
-         * keep them out of the precomputed map so the compile hook compiles the
-         * original untouched. */
-        if (phpatcher_has_halt_compiler(original)) {
-            continue;
+        if (kv.second.creates) {
+            /* Virtual file: no on-disk original; apply() builds it from empty. */
+            original.clear();
+        } else {
+            if (!phpatcher::read_file(kv.first, original)) {
+                continue;
+            }
+            /* Files with __halt_compiler() are never patched (see the runtime
+             * guard); keep them out of the precomputed map so the compile hook
+             * compiles the original untouched. */
+            if (phpatcher_has_halt_compiler(original)) {
+                continue;
+            }
         }
         if (phpatcher::PatchSet::apply(kv.second, original, patched, error, resolver)) {
             (*g_precomputed)[kv.first] = std::move(patched);

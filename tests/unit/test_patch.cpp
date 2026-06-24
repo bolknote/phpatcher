@@ -295,6 +295,71 @@ static void test_r_both_guards_parsed() {
     assert(saw);
 }
 
+static void test_newfile_creates_in_memory() {
+    /* A "# newfile:" section declares a file built from nothing: creates=true and
+     * apply() against an empty original yields the section's content verbatim. */
+    PatchSet ps;
+    std::string error;
+    const std::string patch =
+        "# phpatcher-ed\n# newfile: created.php\n<?php\necho 1;\n.\n";
+    assert(ps.parse(patch, ".", error));
+    const auto* fp = ps.find(PatchSet::canonicalize("created.php", "."));
+    assert(fp != nullptr);
+    assert(fp->creates);
+    std::string out;
+    assert(PatchSet::apply(*fp, "", out, error));
+    assert(out == "<?php\necho 1;\n");
+}
+
+static void test_newfile_empty_is_empty_file() {
+    PatchSet ps;
+    std::string error;
+    assert(ps.parse("# phpatcher-ed\n# newfile: empty.php\n.\n", ".", error));
+    const auto* fp = ps.find(PatchSet::canonicalize("empty.php", "."));
+    assert(fp != nullptr);
+    assert(fp->creates);
+    std::string out;
+    assert(PatchSet::apply(*fp, "", out, error));
+    assert(out.empty());
+}
+
+static void test_newfile_with_corpus_ref() {
+    /* A created file can reference corpus runs just like a change block does. */
+    PatchSet ps;
+    std::string error;
+    const std::string patch =
+        "# phpatcher-ed\n# newfile: t.php\n<?php\n" + r_directive("corpus.php", 1, 2) + "\n.\n";
+    assert(ps.parse(patch, ".", error));
+    const auto* fp = ps.find(PatchSet::canonicalize("t.php", "."));
+    assert(fp != nullptr);
+    assert(fp->creates);
+
+    std::string out;
+    const auto resolver = [&](const EdRef& ref, std::vector<std::string>& lines, std::string&) {
+        assert(ref.path == "corpus.php");
+        lines = {"trait T {", "}"};
+        return true;
+    };
+    assert(PatchSet::apply(*fp, "", out, error, resolver));
+    assert(out == "<?php\ntrait T {\n}\n");
+}
+
+static void test_newfile_duplicate_target_rejected() {
+    /* The same canonical path cannot be both edited and created. */
+    PatchSet ps;
+    std::string error;
+    const bool ok = ps.parse(
+        "# phpatcher-ed\n# file: dup.php\n0a\nx\n.\n# newfile: dup.php\ny\n.\n", ".", error);
+    assert(!ok);
+    assert(error.find("duplicate") != std::string::npos);
+}
+
+static void test_newfile_empty_header_rejected() {
+    std::string error;
+    assert(parse_rejects("# phpatcher-ed\n# newfile:\n.\n", error));
+    assert(error.find("newfile") != std::string::npos);
+}
+
 static void test_duplicate_file_rejected() {
     PatchSet ps;
     std::string error;
@@ -326,6 +391,11 @@ int main() {
     test_r_unquoted_path_resolves();
     test_r_escapes_decoded();
     test_r_both_guards_parsed();
+    test_newfile_creates_in_memory();
+    test_newfile_empty_is_empty_file();
+    test_newfile_with_corpus_ref();
+    test_newfile_duplicate_target_rejected();
+    test_newfile_empty_header_rejected();
     test_duplicate_file_rejected();
     std::cout << "test_patch OK\n";
     return 0;

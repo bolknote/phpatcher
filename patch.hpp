@@ -130,9 +130,17 @@ struct EdCommand {
  * All edits targeting one concrete file. phpatcher intentionally supports only
  * its source-hiding phpatcher-ed format, so a file patch is simply a list of
  * line-addressed commands.
+ *
+ * `creates` marks a "virtual" file introduced by a `# newfile:` section: it has
+ * no on-disk original, so apply() runs against an empty buffer and the extension
+ * materializes the result in memory when the engine asks to compile that path
+ * (the file need not — and typically does not — exist on disk). A create patch
+ * is just a single `0a` (append-after-0) command holding the file's content, so
+ * the same apply()/corpus-reference machinery is reused unchanged.
  */
 struct FilePatch {
     std::vector<EdCommand> commands;
+    bool creates = false;
 };
 
 /*
@@ -147,10 +155,15 @@ public:
     using Entry = std::pair<std::string, FilePatch>;  /* (canonical path, edits) */
 
     /*
-     * Parse a phpatcher-ed patch file. `base_dir` resolves `# file:` paths into
-     * absolute, canonical filesystem paths. Replaces any previously parsed content.
-     * Returns false and fills `error` on a hard parse error (including a file
-     * targeted by more than one section); an empty patch is a successful no-op.
+     * Parse a phpatcher-ed patch file. `base_dir` resolves `# file:` and
+     * `# newfile:` paths into absolute, canonical filesystem paths. Replaces any
+     * previously parsed content. Returns false and fills `error` on a hard parse
+     * error (including a path targeted by more than one section); an empty patch
+     * is a successful no-op.
+     *
+     * A `# newfile: <path>` section is followed directly by the new file's
+     * content (literal lines and/or corpus references), terminated by a lone
+     * ".": it declares a file created in memory, whose FilePatch has creates=true.
      */
     bool parse(const std::string& diff_text, const std::string& base_dir, std::string& error);
 

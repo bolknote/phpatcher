@@ -1,0 +1,5 @@
+# phpatcher-ed v1
+# newfile: fixtures/virtual_broken.php
+<?php
+r "fixtures/does_not_exist.php" 1 1 # s:5
+.

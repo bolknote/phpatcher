@@ -32,9 +32,10 @@ using std::string_view;
 constexpr std::size_t npos = string_view::npos;
 
 /* Tokens recognised in the phpatcher-ed format. */
-constexpr string_view kEdMagic = "# phpatcher-ed";  /* phpatcher-ed selector    */
-constexpr string_view kEdFileHeader = "# file:";    /* per-file section marker  */
-constexpr char kEdInputTerminator = '.';            /* ends an a/c/i input block*/
+constexpr string_view kEdMagic = "# phpatcher-ed";     /* phpatcher-ed selector    */
+constexpr string_view kEdFileHeader = "# file:";       /* per-file section marker  */
+constexpr string_view kEdNewFileHeader = "# newfile:"; /* create-in-memory marker  */
+constexpr char kEdInputTerminator = '.';               /* ends an a/c/i input block*/
 
 bool is_digit(char c) { return c >= '0' && c <= '9'; }
 
@@ -602,6 +603,26 @@ bool PatchSet::parse_ed_bundle(const std::string& diff_text, const std::string& 
             flush_current();
             current_key = canonicalize(std::string(path.substr(s)), base_dir);
             have_current = true;
+            continue;
+        }
+
+        /* "# newfile: <path>" introduces a file created in memory. The lines that
+         * follow (until a lone ".") are its content; we model them as a single
+         * "0a" command against an empty original, so the same apply()/reference
+         * machinery handles creation with no special case downstream. */
+        if (line.substr(0, kEdNewFileHeader.size()) == kEdNewFileHeader) {
+            const string_view path = rtrim(line.substr(kEdNewFileHeader.size()));
+            const std::size_t s = path.find_first_not_of(" \t");
+            if (s == npos) {
+                error = "empty '# newfile:' header in ed bundle";
+                return false;
+            }
+            flush_current();
+            current_key = canonicalize(std::string(path.substr(s)), base_dir);
+            have_current = true;
+            current.creates = true;
+            pending = EdCommand{EdCommand::Append, 0, 0, {}};
+            in_input = true;
             continue;
         }
 

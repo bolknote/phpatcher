@@ -158,6 +158,8 @@ inserted line
 - The first non-blank line must be the `# phpatcher-ed` magic line.
 - `# file: <path>` starts each file section (path resolved against
   `phpatcher.base_dir`).
+- `# newfile: <path>` declares a file **created in memory** (see *Creating new
+  files* below): it has no on-disk original and need not exist on the target.
 - Supported edit commands: `Na` (append after line N), `Ni` (insert before N),
   `M,Nc` / `Nc` (change), `M,Nd` / `Nd` (delete). Each `a/c/i` input block ends
   with a lone `.` line. Commands are applied in order, so they must address
@@ -170,6 +172,44 @@ inserted line
   never has one.
 - An `a/c/i` input line may be a **corpus reference** instead of literal text
   (see below).
+
+### Creating new files (virtual files)
+
+A refactor that introduces a **new file** can be delivered too, even though the
+file never lands on disk. A `# newfile:` section carries the file's full content:
+
+```
+# newfile: src/NewTrait.php
+<?php
+trait NewTrait { /* ... */ }
+.
+```
+
+phpatcher's compile hook runs **before** the engine opens the file, so when PHP
+goes to `require`/`include` a path that matches a `# newfile:` section, phpatcher
+supplies the content from memory and the missing-file open is short-circuited —
+the file is compiled without existing on disk. The content is an ordinary input
+block, so it may also use `r` corpus references.
+
+Notes and limits:
+
+- The section path is resolved against `phpatcher.base_dir`, like `# file:`. A
+  path cannot be both a `# file:` and a `# newfile:` (rejected as a duplicate).
+- The **requiring** code must still reference the path (e.g. `require` it). For
+  symbols resolved at *class-declaration* time (a `use SomeTrait;`, an `extends`
+  / `implements`), make sure the new file is required **before** the file that
+  uses it; symbols resolved at call time (functions, `new`) are order-insensitive.
+- **OPcache:** a virtual file cannot be `stat()`'d, so with
+  `opcache.validate_timestamps=1` it is recompiled through the hook each request
+  rather than cached (correct, just not cached). With validation off it caches
+  normally; `phpatcher.opcache_bind` still invalidates on a patch change.
+- Under `phpatcher.on_error = fail`, a `# newfile:` whose content cannot be
+  produced (e.g. an unresolved `r` reference) compiles a throwing stub instead of
+  letting the original missing-file error through.
+
+`tools/phpatcher-changes` emits `# newfile:` sections automatically for files
+**added** between the base and target revisions (binary and deleted files are
+still skipped).
 
 To produce a phpatcher-ed bundle from git changes, use the libgit2-based
 `tools/phpatcher-changes`. It compares a base revision to either another
@@ -427,9 +467,11 @@ active state, indexed file count and the precomputed file count and byte size.
 
 - Targets plain filesystem includes. Sources loaded through stream wrappers
   (e.g. `phar://`) are not patched.
-- The patch index covers files that exist on disk. Patches for newly added files
-  are not served, since such a file cannot be `include`d from disk in the first
-  place. `phpatcher-changes` emits only modified text files.
+- New files can be created in memory via `# newfile:` sections (see *Creating new
+  files*) and are served when `require`/`include`d, even though they never exist
+  on disk; `phpatcher-changes` emits them automatically for added files. Files
+  cannot be *deleted* from disk by a patch (phpatcher patches compilation, it
+  does not remove files), so deleted files are skipped.
 - Patch application is strict (no fuzz): line-addressed edits and corpus
   reference guards must match the deployed source exactly.
 - Files using `__halt_compiler()` are never patched (their data offset cannot be

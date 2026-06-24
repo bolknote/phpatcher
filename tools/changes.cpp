@@ -68,9 +68,11 @@ void usage(const char *argv0) {
         "      --php PATH       php interpreter for normalized indexes (default: php)\n"
         "      --normalizer PATH path to normalize.php (default: next to this binary)\n"
         "  -h, --help           show this help\n\n"
-        "Only modified text files are represented; added/deleted/binary files are\n"
-        "silently skipped because phpatcher serves patches for files that already\n"
-        "exist on disk and phpatcher-ed bundles cannot encode binary data.\n",
+        "Modified text files become ed-script sections; added text files become\n"
+        "'# newfile:' sections that phpatcher materializes in memory at compile\n"
+        "time (the file need not exist on the target). Deleted and binary files\n"
+        "are skipped: a phpatcher-ed bundle cannot encode binary data, and\n"
+        "phpatcher patches compilation rather than removing files from disk.\n",
         argv0);
 }
 
@@ -507,6 +509,18 @@ void emit_added_corpus(std::ostream &out, const std::vector<std::string> &added,
     }
 }
 
+/* Emit a "# newfile:" section: the whole content of an added file, de-duplicated
+ * against the corpus exactly like added lines in a change block, so a created
+ * file can reference corpus runs instead of re-printing them. */
+void emit_newfile(std::ostream &out, const std::string &path,
+                  const std::vector<std::string> &lines, const Options &opt,
+                  const Index *idx, Corpus *corpus, Normalizer *normalizer) {
+    out << "# newfile: " << path << "\n";
+    if (opt.corpus && idx && corpus) emit_added_corpus(out, lines, opt, *idx, *corpus, normalizer);
+    else emit_added_plain(out, lines);
+    out << ".\n";
+}
+
 void emit_change(std::ostream &out, const Change &c, const Options &opt,
                  const Index *idx, Corpus *corpus, Normalizer *normalizer) {
     if (c.old_count == 0) {
@@ -671,20 +685,17 @@ int main(int argc, char **argv) {
 
     for (std::size_t i = 0; i < nd; ++i) {
         const git_diff_delta *d = git_diff_get_delta(diff.get(), i);
-        if (!d || d->status != GIT_DELTA_MODIFIED) continue;
+        if (!d) continue;
+        const bool added = d->status == GIT_DELTA_ADDED;
+        const bool modified = d->status == GIT_DELTA_MODIFIED;
+        if (!added && !modified) continue;  /* deleted/renamed/etc: not encodable */
         if ((d->flags & GIT_DIFF_FLAG_BINARY) != 0) continue;
 
         const char *path_c = d->new_file.path ? d->new_file.path : d->old_file.path;
         if (!path_c) continue;
         const std::string path(path_c);
 
-        BlobPtr old_blob;
-        load_blob(repo.get(), &d->old_file.id, old_blob);
-        if (git_blob_is_binary(old_blob.get())) continue;
-        const std::string_view old_buf(
-            static_cast<const char*>(git_blob_rawcontent(old_blob.get())),
-            git_blob_rawsize(old_blob.get()));
-
+        /* Fetch the new-side content (shared by added and modified files). */
         std::string new_storage;
         std::string_view new_buf;
         BlobPtr new_blob;
@@ -700,6 +711,25 @@ int main(int argc, char **argv) {
             if (contains_nul(new_storage)) continue;
             new_buf = new_storage;
         }
+
+        if (added) {
+            /* A new file has no on-disk original on the target: emit its whole
+             * content as a "# newfile:" section phpatcher creates in memory. */
+            std::vector<std::string> lines;
+            for (std::string_view sv : split_lines(new_buf)) lines.emplace_back(sv);
+            emit_newfile(*out, path, lines, opt, opt.corpus ? &index : nullptr,
+                         opt.corpus ? corpus.get() : nullptr,
+                         index.normalized() ? &normalizer : nullptr);
+            ++emitted;
+            continue;
+        }
+
+        BlobPtr old_blob;
+        load_blob(repo.get(), &d->old_file.id, old_blob);
+        if (git_blob_is_binary(old_blob.get())) continue;
+        const std::string_view old_buf(
+            static_cast<const char*>(git_blob_rawcontent(old_blob.get())),
+            git_blob_rawsize(old_blob.get()));
 
         std::vector<Change> changes = diff_buffers(path, old_buf, new_buf);
         if (changes.empty()) continue;
