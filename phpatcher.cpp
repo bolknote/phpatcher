@@ -22,6 +22,7 @@ extern "C" {
 #include "ext/standard/info.h"
 #include "Zend/zend_API.h"
 #include "Zend/zend_compile.h"
+#include "Zend/zend_execute.h"
 #include "Zend/zend_stream.h"
 #include "Zend/zend_system_id.h"
 #include "Zend/zend_virtual_cwd.h"
@@ -82,6 +83,24 @@ static std::string g_base_dir;
 
 /* Previous compile_file handler in the chain (e.g. OPcache). */
 static zend_op_array *(*phpatcher_orig_compile_file)(zend_file_handle *, int) = nullptr;
+
+/* Previous path resolver in the chain (e.g. OPcache). Installed only when the
+ * patch creates at least one virtual file: a "# newfile:" target does not exist
+ * on disk, so the engine's resolver (and OPcache's, which runs the include
+ * lookup *before* the compile hook) returns NULL and the include fails before we
+ * ever see it. Resolving such a path to its canonical key lets the include
+ * proceed; compilation then chains down to our compile hook, which supplies the
+ * content. nullptr means no virtual files, so the resolver is left untouched. */
+static zend_string *(*phpatcher_orig_resolve_path)(zend_string *) = nullptr;
+
+/* Previous stream opener in the chain. Installed only when the patch creates a
+ * virtual file. OPcache resolves an include by *opening* the file before it ever
+ * calls the compile hook (ZendAccelerator.c: persistent_compile_file), and on a
+ * missing file it reports "Failed to open stream" and returns without chaining.
+ * Our compile-hook injection therefore never runs under OPcache for a created
+ * file. Supplying the content here, where the engine opens the stream, makes the
+ * open succeed so compilation proceeds — for OPcache and the plain engine alike. */
+static zend_result (*phpatcher_orig_stream_open)(zend_file_handle *) = nullptr;
 
 /* Runtime failure counters, exposed via phpatcher_stats() so a drifted patch is
  * observable even when E_WARNING is silenced in production. Atomic for ZTS. */
@@ -443,6 +462,83 @@ static std::string phpatcher_fail_stub(const std::string &path, const std::strin
            "unpatched code for " + escape(path) + " (" + escape(reason) + ")');\n";
 }
 
+/* Resolve a path the engine could not (a missing file) to the canonical key of a
+ * "# newfile:" entry, so an include of a virtual file is not rejected before the
+ * compile hook runs. Everything that does exist, and every miss that is not a
+ * created file, is delegated unchanged — the smallest possible blast radius. */
+static zend_string *phpatcher_resolve_path(zend_string *filename) {
+    zend_string *resolved = phpatcher_orig_resolve_path
+        ? phpatcher_orig_resolve_path(filename)
+        : nullptr;
+    if (resolved != nullptr || g_patchset == nullptr || filename == nullptr) {
+        return resolved;
+    }
+
+    const std::string canon = phpatcher::PatchSet::canonicalize(
+        std::string(ZSTR_VAL(filename), ZSTR_LEN(filename)), g_base_dir);
+    const phpatcher::FilePatch *fp = g_patchset->find(canon);
+    if (fp != nullptr && fp->creates) {
+        return zend_string_init(canon.c_str(), canon.size(), 0);
+    }
+    return nullptr;
+}
+
+/* Open a "# newfile:" virtual file by handing its (patched) content to the
+ * engine through the file handle's in-memory buffer. This is what lets OPcache —
+ * which opens the include itself before invoking the compile hook — proceed
+ * instead of failing the require on a file that is not on disk.
+ *
+ * A created file is detected *before* delegating to the real opener: the real
+ * opener would otherwise emit a spurious "Failed to open stream" for the missing
+ * file even though we go on to supply its content. Real files and unrelated
+ * misses are delegated unchanged. The fail-closed policy matches the compile
+ * hook: a created file whose patch fails compiles a throwing stub rather than
+ * running nothing. */
+static zend_result phpatcher_stream_open(zend_file_handle *handle) {
+    if (g_patchset != nullptr && handle != nullptr && handle->filename != nullptr) {
+        const std::string_view base = phpatcher_basename(handle);
+        if (!base.empty() && g_patchset->has_basename(base)) {
+            const std::string canon = phpatcher::PatchSet::canonicalize(
+                std::string(ZSTR_VAL(handle->filename), ZSTR_LEN(handle->filename)), g_base_dir);
+            if (const phpatcher::FilePatch *fp = g_patchset->find(canon); fp && fp->creates) {
+                const std::string *patched = nullptr;
+                std::string owned;
+                std::string content;
+                switch (phpatcher_get_patched(canon, *fp, patched, owned)) {
+                    case PatchStatus::Ok:
+                        content = *patched;
+                        break;
+                    case PatchStatus::Fail:
+                    case PatchStatus::Skip:
+                        /* Without fail-closed, fail the open so the include
+                         * behaves as if the file were absent; with it, compile a
+                         * throwing stub instead of running nothing. */
+                        if (!phpatcher_fail_closed()) {
+                            return FAILURE;
+                        }
+                        content = phpatcher_fail_stub(canon, "patch failed");
+                        break;
+                }
+
+                /* Same buffer contract as phpatcher_inject_source: emalloc'd with
+                 * ZEND_MMAP_AHEAD trailing zero bytes, freed by
+                 * zend_destroy_file_handle. */
+                char *buf = static_cast<char *>(emalloc(content.size() + ZEND_MMAP_AHEAD));
+                memcpy(buf, content.data(), content.size());
+                memset(buf + content.size(), 0, ZEND_MMAP_AHEAD);
+                handle->buf = buf;
+                handle->len = content.size();
+                if (!handle->opened_path) {
+                    handle->opened_path = zend_string_init(canon.c_str(), canon.size(), 0);
+                }
+                return SUCCESS;
+            }
+        }
+    }
+
+    return phpatcher_orig_stream_open ? phpatcher_orig_stream_open(handle) : FAILURE;
+}
+
 static zend_op_array *phpatcher_compile_file(zend_file_handle *file_handle, int type) {
     /* Eligible to patch only when we have an index, a path to look up, and the
      * source has not already been buffered by an earlier hook. */
@@ -728,6 +824,24 @@ PHP_MINIT_FUNCTION(phpatcher) {
     phpatcher_orig_compile_file = zend_compile_file;
     zend_compile_file = phpatcher_compile_file;
 
+    /* Only when the patch creates virtual files, also wrap the path resolver so
+     * an include of a not-on-disk "# newfile:" target resolves instead of failing
+     * before the compile hook (notably under OPcache, whose include lookup runs
+     * first). No virtual files -> resolver untouched, zero overhead. */
+    bool has_virtual = false;
+    for (const auto &kv : g_patchset->files()) {
+        if (kv.second.creates) {
+            has_virtual = true;
+            break;
+        }
+    }
+    if (has_virtual) {
+        phpatcher_orig_resolve_path = zend_resolve_path;
+        zend_resolve_path = phpatcher_resolve_path;
+        phpatcher_orig_stream_open = zend_stream_open_function;
+        zend_stream_open_function = phpatcher_stream_open;
+    }
+
     return SUCCESS;
 }
 
@@ -739,6 +853,16 @@ PHP_MSHUTDOWN_FUNCTION(phpatcher) {
         zend_compile_file == phpatcher_compile_file) {
         zend_compile_file = phpatcher_orig_compile_file;
         phpatcher_orig_compile_file = nullptr;
+    }
+    if (phpatcher_orig_resolve_path != nullptr &&
+        zend_resolve_path == phpatcher_resolve_path) {
+        zend_resolve_path = phpatcher_orig_resolve_path;
+        phpatcher_orig_resolve_path = nullptr;
+    }
+    if (phpatcher_orig_stream_open != nullptr &&
+        zend_stream_open_function == phpatcher_stream_open) {
+        zend_stream_open_function = phpatcher_orig_stream_open;
+        phpatcher_orig_stream_open = nullptr;
     }
 
     delete g_patchset;

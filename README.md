@@ -185,11 +185,13 @@ trait NewTrait { /* ... */ }
 .
 ```
 
-phpatcher's compile hook runs **before** the engine opens the file, so when PHP
-goes to `require`/`include` a path that matches a `# newfile:` section, phpatcher
-supplies the content from memory and the missing-file open is short-circuited —
-the file is compiled without existing on disk. The content is an ordinary input
-block, so it may also use `r` corpus references.
+When PHP goes to `require`/`include` a path that matches a `# newfile:` section,
+phpatcher supplies the content from memory and the missing-file open is
+short-circuited — the file is compiled without existing on disk. This works both
+for the plain engine and under OPcache (which opens the include itself, before
+the compile hook, to resolve its path): phpatcher answers that open from memory
+rather than letting it fail. The content is an ordinary input block, so it may
+also use `r` corpus references.
 
 Notes and limits:
 
