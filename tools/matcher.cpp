@@ -323,12 +323,15 @@ std::string make_guard(Corpus &corpus, const Index &idx, const Options &opt,
         : "s:" + std::to_string(len);
 }
 
+/* See the matching comment in changes.cpp. Within a factorized run every line
+ * is a verified token match of its corpus line, so we reference the corpus core
+ * (canonical spacing) wrapped in dst's own indentation even when only the
+ * internal whitespace differs. Fails only on a blank line (no core to wrap). */
 bool trim_pad_for(std::string_view src, std::string_view dst,
                   std::string_view &lpad, std::string_view &rpad) {
     const std::string_view core = phpatcher::match::trim(src);
-    if (core.empty()) return false;
     const std::string_view dtrim = phpatcher::match::trim(dst);
-    if (dtrim != core) return false;
+    if (core.empty() || dtrim.empty()) return false;
     const std::size_t off = static_cast<std::size_t>(dtrim.data() - dst.data());
     lpad = dst.substr(0, off);
     rpad = dst.substr(off + dtrim.size());

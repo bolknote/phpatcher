@@ -391,12 +391,22 @@ std::string make_guard(Corpus &corpus, const Index &idx, const Options &opt,
         : "s:" + std::to_string(len);
 }
 
+/* Compute the padding that re-wraps a corpus line's trimmed core so an
+ * `r A B "lpad" "rpad"` reference reproduces `dst`'s own indentation. This is
+ * only called for a line inside a factorized run, where every block line is
+ * already a token-for-token match of its corpus line (factorize verified the
+ * normalized keys are equal). The corpus core therefore *is* dst's code — only
+ * its surrounding and/or internal whitespace (and comments) may differ — so
+ * referencing it deduplicates the line, reproducing the corpus's canonical
+ * spacing wrapped in dst's leading/trailing whitespace. Earlier this also
+ * required the trimmed cores to be byte-identical, which needlessly forced any
+ * line edited only in its *internal* spacing back to a verbatim literal.
+ * Fails only when either side has no core to wrap (a blank line). */
 bool trim_pad_for(std::string_view src, std::string_view dst,
                   std::string_view &lpad, std::string_view &rpad) {
     const std::string_view core = phpatcher::match::trim(src);
-    if (core.empty()) return false;
     const std::string_view dtrim = phpatcher::match::trim(dst);
-    if (dtrim != core) return false;
+    if (core.empty() || dtrim.empty()) return false;
     const std::size_t off = static_cast<std::size_t>(dtrim.data() - dst.data());
     lpad = dst.substr(0, off);
     rpad = dst.substr(off + dtrim.size());
